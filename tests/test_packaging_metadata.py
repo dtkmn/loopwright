@@ -29,9 +29,9 @@ def locked_dependency_strings(entries: list[dict]) -> tuple[str, ...]:
 
 def locked_project_package() -> dict:
     for package in uv_lock()["package"]:
-        if package["name"] == "ai-loop-engine":
+        if package["name"] == "loopwright":
             return package
-    raise AssertionError("ai-loop-engine package missing from uv.lock")
+    raise AssertionError("loopwright package missing from uv.lock")
 
 
 def test_runtime_requirements_match_pyproject_dependencies():
@@ -48,8 +48,11 @@ def test_dev_requirements_match_pyproject_dev_group():
 
 def test_console_scripts_are_declared():
     scripts = pyproject()["project"]["scripts"]
+    assert scripts["loopwright"] == "src.app:main"
     assert scripts["ai-loop-engine"] == "src.app:main"
+    assert scripts["loopwright-eval"] == "src.loop_eval:main"
     assert scripts["ai-loop-eval"] == "src.loop_eval:main"
+    assert scripts["loopwright-ollama-eval"] == "src.ollama_model_eval:main"
     assert scripts["ai-loop-ollama-eval"] == "src.ollama_model_eval:main"
 
 

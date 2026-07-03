@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="650" viewBox="0 0 1600 650" role="img" aria-labelledby="title desc">
-  <title id="title">AI Loop Engine flow</title>
-  <desc id="desc">A diagram of AI Loop Engine showing smart evidence routing, loop execution, guardrails, loop reports, sessions, replay, and optional framework adapters.</desc>
+  <title id="title">Loopwright flow</title>
+  <desc id="desc">A diagram of Loopwright showing smart evidence routing, loop execution, guardrails, loop reports, sessions, replay, and optional framework adapters.</desc>
   <defs>
     <style>
       .bg { fill: #f8fafc; }
@@ -33,8 +33,8 @@
   </defs>
 
   <rect class="bg" width="1600" height="650"/>
-  <text class="title" x="54" y="54">AI Loop Engine</text>
-  <text class="subtitle" x="54" y="84">Local-first loop inspection for context, drafting, format checks, verification, retries, refusals, sessions, and replay.</text>
+  <text class="title" x="54" y="54">Loopwright</text>
+  <text class="subtitle" x="54" y="84">Agent loop inspection for context, drafting, format checks, verification, retries, refusals, sessions, and replay.</text>
 
   <rect class="band context" x="54" y="120" rx="14" ry="14" width="294" height="360"/>
   <text class="label" x="80" y="158">Evidence Providers</text>

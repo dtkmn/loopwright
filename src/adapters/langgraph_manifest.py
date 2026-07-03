@@ -12,7 +12,7 @@ from src.loop_engine import LoopReport, LoopSession
 
 ADAPTER_NAME = "langgraph_manifest"
 ADAPTER_SCHEMA_VERSION = "langgraph-manifest-export/v1"
-CHECKPOINT_NAMESPACE = "ai_loop_engine"
+CHECKPOINT_NAMESPACE = "loopwright"
 
 
 class LangGraphManifestAdapter:

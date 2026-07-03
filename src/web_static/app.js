@@ -1,5 +1,7 @@
-const ACTIVE_THREAD_STORAGE_KEY = "ai-loop-engine.active-thread.v1";
-const ACTIVE_RECIPE_STORAGE_KEY = "ai-loop-engine.active-recipe.v1";
+const ACTIVE_THREAD_STORAGE_KEY = "loopwright.active-thread.v1";
+const ACTIVE_RECIPE_STORAGE_KEY = "loopwright.active-recipe.v1";
+const LEGACY_ACTIVE_THREAD_STORAGE_KEY = "ai-loop-engine.active-thread.v1";
+const LEGACY_ACTIVE_RECIPE_STORAGE_KEY = "ai-loop-engine.active-recipe.v1";
 const LEGACY_THREAD_STORAGE_KEY = "ai-loop-engine.threads.v1";
 const DEFAULT_THREAD_TITLE = "New thread";
 const MAX_THREADS = 30;
@@ -520,13 +522,19 @@ function legacyActiveThreadId() {
 
 function loadActiveThreadId() {
   const activeId = String(
-    globalThis.localStorage?.getItem(ACTIVE_THREAD_STORAGE_KEY) || "",
+    globalThis.localStorage?.getItem(ACTIVE_THREAD_STORAGE_KEY) ||
+      globalThis.localStorage?.getItem(LEGACY_ACTIVE_THREAD_STORAGE_KEY) ||
+      "",
   );
   return activeId || legacyActiveThreadId();
 }
 
 function loadActiveRecipeId() {
-  return String(globalThis.localStorage?.getItem(ACTIVE_RECIPE_STORAGE_KEY) || "");
+  return String(
+    globalThis.localStorage?.getItem(ACTIVE_RECIPE_STORAGE_KEY) ||
+      globalThis.localStorage?.getItem(LEGACY_ACTIVE_RECIPE_STORAGE_KEY) ||
+      "",
+  );
 }
 
 function persistActiveThreadId() {

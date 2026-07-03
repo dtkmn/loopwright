@@ -82,7 +82,8 @@ MAX_SESSION_ID_LENGTH = 96
 MAX_QUERY_HISTORY_MESSAGES = 12
 MAX_SEMANTIC_MEMORY_MESSAGES = 4
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
-THREAD_DB_PATH_ENV = "AI_LOOP_THREAD_DB_PATH"
+THREAD_DB_PATH_ENV = "LOOPWRIGHT_THREAD_DB_PATH"
+LEGACY_THREAD_DB_PATH_ENV = "AI_LOOP_THREAD_DB_PATH"
 qa_system: Optional[AILoopEngine] = None
 thread_store_system: Optional[ThreadStore] = None
 
@@ -142,9 +143,15 @@ def get_engine() -> AILoopEngine:
 
 def default_thread_store_path() -> Path:
     configured_path = os.getenv(THREAD_DB_PATH_ENV)
+    if not configured_path:
+        configured_path = os.getenv(LEGACY_THREAD_DB_PATH_ENV)
     if configured_path:
         return Path(configured_path).expanduser()
-    return Path.home() / ".ai-loop-engine" / "threads.sqlite3"
+    new_default = Path.home() / ".loopwright" / "threads.sqlite3"
+    legacy_default = Path.home() / ".ai-loop-engine" / "threads.sqlite3"
+    if legacy_default.exists() and not new_default.exists():
+        return legacy_default
+    return new_default
 
 
 def get_thread_store() -> ThreadStore:

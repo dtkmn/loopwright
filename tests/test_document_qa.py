@@ -1138,7 +1138,7 @@ def test_smart_web_verifier_failure_falls_back_to_unverified_direct_answer():
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 return (
                     "Loop engineering means designing and inspecting the repeated "
                     "AI workflow around context, drafting, checking, retrying, and "
@@ -1209,7 +1209,7 @@ def test_smart_web_mechanical_failure_does_not_fallback_to_direct_answer():
         last_thinking = None
 
         def invoke(self, prompt):
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise AssertionError(
                     "mechanical citation failure must not fallback to direct answer"
                 )
@@ -1262,7 +1262,7 @@ def test_smart_web_verifier_failure_with_broken_direct_fallback_returns_safe_err
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise RuntimeError("DIRECT_MODEL_SECRET_FAILURE")
             return "SECRET_REJECTED_WEB_DRAFT is not supported enough [1]."
 
@@ -1333,7 +1333,7 @@ def test_explicit_web_verifier_failure_does_not_fallback_to_direct_answer():
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise AssertionError("explicit web must not fallback to direct answer")
             return "Loop engineering is a complete agent architecture pattern [1]."
 
@@ -1369,7 +1369,7 @@ def test_smart_web_search_failure_falls_back_to_unverified_direct_answer():
         invoke=lambda prompt: (
             "I can explain loop engineering from model knowledge, but this "
             "answer is not verified by web evidence."
-            if prompt.startswith("You are AI Loop Engine running without")
+            if prompt.startswith("You are Loopwright running without")
             else "unexpected"
         ),
         last_thinking=None,
@@ -1410,7 +1410,7 @@ def test_smart_web_search_failure_with_broken_direct_fallback_returns_safe_error
         last_thinking = None
 
         def invoke(self, prompt):
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise RuntimeError("DIRECT_MODEL_SECRET_FAILURE")
             return "unexpected"
 
@@ -1507,7 +1507,7 @@ def test_smart_web_terminal_fallback_errors_redact_draft_outputs(
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 if expected_error == "empty_direct_answer":
                     self.last_thinking = "SECRET_EMPTY_FALLBACK_THINKING"
                 return fallback_answer

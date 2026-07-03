@@ -3,9 +3,9 @@ requires = ["setuptools>=80", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ai-loop-engine"
+name = "loopwright"
 version = "0.1.0"
-description = "Local-first engine for inspecting and hardening AI answer loops."
+description = "Flight recorder for inspecting, verifying, and replaying AI agent loops."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "MIT"
@@ -33,12 +33,15 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/dtkmn/ai-loop-engine"
-Issues = "https://github.com/dtkmn/ai-loop-engine/issues"
+Repository = "https://github.com/dtkmn/loopwright"
+Issues = "https://github.com/dtkmn/loopwright/issues"
 
 [project.scripts]
+loopwright = "src.app:main"
 ai-loop-engine = "src.app:main"
+loopwright-eval = "src.loop_eval:main"
 ai-loop-eval = "src.loop_eval:main"
+loopwright-ollama-eval = "src.ollama_model_eval:main"
 ai-loop-ollama-eval = "src.ollama_model_eval:main"
 
 [dependency-groups]

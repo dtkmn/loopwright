@@ -2,8 +2,8 @@
 
 ## Project Overview
 
-This repository is AI Loop Engine, a local-first engine for inspecting and
-hardening AI loops: context selection, retrieval, answer
+This repository is Loopwright, a flight recorder for inspecting and hardening
+AI loops: context selection, retrieval, answer
 drafting, mechanical checks, verifier decisions, retries, refusals, evals, and
 eventual replay. The current built-in evidence providers are Smart Evidence
 routing, DuckDuckGo web snippets, optional uploaded-file context, thread memory,
@@ -77,7 +77,7 @@ Primary runtime files:
 
 - Install local dependencies: `uv sync --dev`
 - Pip fallback: `python -m pip install -r requirements-dev.txt`
-- Run the app locally: `uv run ai-loop-engine` or `python -m src.app`
+- Run the app locally: `uv run loopwright` or `python -m src.app`
 - Run tests: `uv run pytest` or `python -m pytest`
 - Compile check: `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/loop_eval.py src/ollama_model_eval.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_ollama_model_eval.py tests/test_packaging_metadata.py tests/test_thread_store.py`
 - Dependency checks: `python -m pip check` and `python -m pip_audit -r requirements.txt --strict`
@@ -138,7 +138,7 @@ Primary runtime files:
   runs may validate builds, but must not publish release images.
 - Preserve deterministic generation for context-grounded answers unless a
   test-backed product reason requires changing it.
-- `LLM_BACKEND=auto` is local-first and real-backend-only: it selects Ollama
+- `LLM_BACKEND=auto` is local-runtime and real-backend-only: it selects Ollama
   and fails closed if Ollama or the configured model is unavailable. Explicit
   `LLM_BACKEND=mock` is only for tests/demos and must never be an automatic
   fallback.
@@ -172,10 +172,11 @@ Primary runtime files:
   hashing for deterministic demos/tests.
 - `LLM_BACKEND=auto` must select Ollama only. It must not silently select mock,
   provider-specific hosted backends, or in-process model loading.
-- Product direction is local-first. First-party model providers are Ollama and
-  generic OpenAI-compatible gateways; do not reintroduce provider-token happy
-  paths without an explicit product decision.
-- Product identity is AI Loop Engine. Uploaded-file answering and web evidence
+- Product direction is private by default and portable across local or gateway
+  runtimes. First-party model providers are Ollama and generic
+  OpenAI-compatible gateways; do not reintroduce provider-token happy paths
+  without an explicit product decision.
+- Product identity is Loopwright. Uploaded-file answering and web evidence
   are context provider capabilities, not the repo's strategic identity.
 - Typed loop records are the contract surface for future agent work. Add or
   update `LoopRecipe`, `LoopRun`, `LoopStep`, `LoopDecision`, `LoopReport`,

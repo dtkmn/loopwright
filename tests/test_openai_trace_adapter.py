@@ -249,9 +249,9 @@ def test_export_report_maps_loop_report_to_openai_trace_shape():
 
     trace = payload["trace"]
     assert trace["trace_id"] == "trace_run_phoenix"
-    assert trace["workflow_name"] == "AI Loop Engine"
+    assert trace["workflow_name"] == "Loopwright"
     assert trace["group_id"] == "session_local"
-    assert trace["metadata"]["ai_loop_engine_run_id"] == "run_phoenix"
+    assert trace["metadata"]["loopwright_run_id"] == "run_phoenix"
     assert trace["metadata"]["final_decision"] == "supported"
     assert [span["span_data"]["phase"] for span in trace["spans"]] == [
         "retrieve",

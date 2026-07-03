@@ -23,7 +23,7 @@ except ImportError:
     from loop_engine import PUBLIC_REDACTION_REASON, PUBLIC_REDACTION_TEXT
 
 
-APP_TITLE = "AI Loop Engine"
+APP_TITLE = "Loopwright"
 TERMINAL_PUBLIC_REDACTION = PUBLIC_REDACTION_TEXT
 MODEL_THINKING_REDACTION = "[redacted: terminal loop decision]"
 MODEL_THINKING_LABEL = "Model Thinking (unverified)"

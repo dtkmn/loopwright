@@ -2801,7 +2801,7 @@ class AILoopEngine:
             loop_recipe,
         )
         return (
-            "You are AI Loop Engine running without an external context provider. "
+            "You are Loopwright running without an external context provider. "
             "Answer the user's current question directly. Match the depth the "
             "user asks for: give a fuller step-by-step explanation when they "
             "ask for detail, and keep simple yes/no or factual answers brief. "

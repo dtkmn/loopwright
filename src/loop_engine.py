@@ -285,7 +285,7 @@ def default_loop_recipe(*, created_at: Optional[datetime] = None) -> LoopRecipe:
     return LoopRecipe(
         recipe_id=DEFAULT_LOOP_RECIPE_ID,
         name=DEFAULT_LOOP_RECIPE_NAME,
-        description="Default local-first loop behavior.",
+        description="Default evidence loop behavior.",
         goal=DEFAULT_LOOP_RECIPE_GOAL,
         instructions=DEFAULT_LOOP_RECIPE_INSTRUCTIONS,
         success_criteria=DEFAULT_LOOP_RECIPE_SUCCESS_CRITERIA,

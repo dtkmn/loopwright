@@ -12,7 +12,7 @@ from src.loop_engine import LoopReport, LoopSession
 
 ADAPTER_NAME = "openai_trace"
 ADAPTER_SCHEMA_VERSION = "openai-trace-export/v1"
-WORKFLOW_NAME = "AI Loop Engine"
+WORKFLOW_NAME = "Loopwright"
 GENERATION_PHASES = frozenset({"draft"})
 GUARDRAIL_PHASES = frozenset({"verify"})
 
@@ -87,8 +87,8 @@ def _trace_from_run(
     run: Mapping[str, Any], *, trace_id: str, public: bool
 ) -> Dict[str, Any]:
     metadata = {
-        "ai_loop_engine_run_id": run["run_id"],
-        "ai_loop_engine_schema": "loop-report/v1",
+        "loopwright_run_id": run["run_id"],
+        "loopwright_schema": "loop-report/v1",
         "context_provider": run["context_provider"],
         "backend": run["backend"],
         "model_label": run["model_label"],

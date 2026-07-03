@@ -1,4 +1,4 @@
-"""Canonical public runtime API for AI Loop Engine.
+"""Canonical public runtime API for Loopwright.
 
 The runtime implementation lives in ``src.ai_loop_runtime``. The historical
 ``src.DocumentQA`` module remains as a compatibility shim.

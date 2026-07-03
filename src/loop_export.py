@@ -19,7 +19,7 @@ ADAPTERS = {
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export AI Loop Engine JSONL replay artifacts to adapter JSON.",
+        description="Export Loopwright JSONL replay artifacts to adapter JSON.",
     )
     parser.add_argument(
         "--adapter",

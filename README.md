@@ -1,11 +1,11 @@
-# AI Loop Engine
-AI Loop Engine is a local-first engine for inspecting and hardening AI answer
-loops: context selection, retrieval, drafting, format checks, citation checks,
-claim verification, retries, refusals, middleware guardrails, evals, and replay. The
+# Loopwright
+Loopwright is a flight recorder for AI agent loops. It inspects and hardens
+context selection, retrieval, drafting, format checks, citation checks, claim
+verification, retries, refusals, middleware guardrails, evals, and replay. The
 current built-in evidence sources are Smart Evidence routing, DuckDuckGo web
 snippets, optional uploaded files, thread memory, and direct model knowledge.
-The product focus is the loop: making agent behavior visible, testable, and
-harder to fake.
+The product focus is trust: making agent behavior visible, testable, and harder
+to fake.
 
 ## Features
 - **Loop Engineering Core:** Treats retrieval, drafting, format checks, self-checking, retry, refusal, middleware guardrails, and evals as the product surface rather than hidden plumbing
@@ -20,7 +20,7 @@ harder to fake.
 - **Smart Evidence Routing:** Uses web evidence for lookup/current questions,
   indexed files when a file is active and relevant, or direct model knowledge
   for private/local tasks such as rewriting, coding, and reasoning
-- **Local-first LLM Backend:** Recommended local path is Ollama; cloud or
+- **Private Runtime Path:** Recommended local runtime is Ollama; cloud or
   gateway deployment uses a generic OpenAI-compatible chat-completions backend
 - **Vector Search:** Uses FAISS for efficient similarity search with
   provider-backed embedding models through Ollama or OpenAI-compatible gateways
@@ -34,14 +34,14 @@ harder to fake.
   generation so Python document indexing stays lightweight and stable
 
 
-![AI Loop Engine flow](docs/ai-loop-engine-flow.svg)
+![Loopwright flow](docs/loopwright-flow.svg)
 
 ## Installation
 
 ### Prerequisites
 - Python 3.11 or 3.12; Python 3.12 is what CI and Docker use
 - `uv` for the recommended local workflow ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
-- Ollama installed for the recommended local-first setup
+- Ollama installed for the recommended local runtime
 - Optional: an OpenAI-compatible model gateway for cloud or remote deployment
   (`/v1/chat/completions` shape)
 - Enough memory for the Ollama model you choose; small models are strongly
@@ -52,8 +52,8 @@ harder to fake.
 1. Clone the repository:
     
     ```bash
-    git clone https://github.com/dtkmn/ai-loop-engine.git
-    cd ai-loop-engine
+    git clone https://github.com/dtkmn/loopwright.git
+    cd loopwright
     ``` 
 
 2. Install dependencies with `uv`:
@@ -70,7 +70,7 @@ harder to fake.
     python -m pip install -r requirements-dev.txt
     ```
 
-3. Run local-first with Ollama:
+3. Run with Ollama:
 
     Terminal 1, unless the Ollama desktop app/service is already running:
 
@@ -88,7 +88,7 @@ harder to fake.
 
     Edit `.env` if you pulled a different chat or embedding model. The app
     loads `.env` and `.env.local` automatically when started with
-    `uv run ai-loop-engine` or `python -m src.app`; shell exports still override
+    `uv run loopwright` or `python -m src.app`; shell exports still override
     file values for one-off runs. Both local files are ignored by git.
 
     `LLM_BACKEND` selects the provider runtime. `LLM_MODEL` chooses the chat
@@ -97,7 +97,7 @@ harder to fake.
     advertise the `thinking` capability; set it to `false` if you want final
     answers and loop evidence only. `OLLAMA_THINK_LEVEL` can be set to `low`,
     `medium`, `high`, or `max` for models that support levels. GPT-OSS accepts
-    only `low`, `medium`, or `high`; when left on `auto`, AI Loop Engine sends
+    only `low`, `medium`, or `high`; when left on `auto`, Loopwright sends
     `medium` for GPT-OSS and `true` for other thinking-capable Ollama models.
 
 4. (Optional) choose a different backend:
@@ -139,17 +139,20 @@ harder to fake.
     ```
 
     Thread messages are stored locally in SQLite at
-    `~/.ai-loop-engine/threads.sqlite3` by default. Override this when you want
-    project-local or container-mounted persistence:
+    `~/.loopwright/threads.sqlite3` by default. If you already have the old
+    `~/.ai-loop-engine/threads.sqlite3` database and no Loopwright database
+    exists yet, Loopwright keeps using the old file so existing history does
+    not disappear during the rename. Override this when you want project-local
+    or container-mounted persistence:
 
     ```dotenv
-    AI_LOOP_THREAD_DB_PATH=.ai-loop-engine/threads.sqlite3
+    LOOPWRIGHT_THREAD_DB_PATH=.loopwright/threads.sqlite3
     ```
 
 8. Run the application:
 
     ```bash
-    uv run ai-loop-engine
+    uv run loopwright
     ```
 
     Pip fallback after activating `venv`:
@@ -165,7 +168,7 @@ The application is containerized for easy deployment.
 ### Build the Docker Image
 
    ```bash
-   docker build -t ai-loop-engine .
+   docker build -t loopwright .
    ```
 
 ### Run the Container
@@ -173,7 +176,7 @@ The application is containerized for easy deployment.
    ```bash
    docker run -p 7860:7860 \
      -e LLM_BACKEND=mock \
-     ai-loop-engine
+     loopwright
    ```
 
 For a deployed model gateway:
@@ -185,10 +188,10 @@ For a deployed model gateway:
      -e LLM_MODEL=your-chat-model \
      -e EMBEDDINGS_MODEL=your-embedding-model \
      -e OPENAI_COMPAT_API_KEY=optional_token_here \
-     ai-loop-engine
+     loopwright
    ```
 
-**Note:** `LLM_BACKEND=auto` is local-first and real-backend-only: it selects
+**Note:** `LLM_BACKEND=auto` is local-runtime and real-backend-only: it selects
 Ollama and fails closed if Ollama is not reachable. Use explicit
 `LLM_BACKEND=mock` only for deterministic demos/tests.
 
@@ -273,7 +276,7 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
 ### Model
 - **LLM backend:** Configurable via `LLM_BACKEND`
   - `ollama`: local Ollama server via `OLLAMA_BASE_URL`; recommended for local use
-  - `auto` (default): local-first real path; selects Ollama and fails closed if unavailable
+  - `auto` (default): local real-backend path; selects Ollama and fails closed if unavailable
   - `openai-compatible`: OpenAI-style `/v1/chat/completions` endpoint for cloud,
     private gateway, vLLM, llama.cpp server, LM Studio, or similar runtimes
   - `mock`: explicit deterministic demo/test backend; never used as fallback
@@ -314,16 +317,17 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
   or FAISS load native libraries. This is intentional: upload stability beats
   native thread-pool surprises on local Macs.
 
-## Local-First Direction
-- The product direction is **download and run locally first**. Ollama is the
-  recommended path for Mac and workstation use because it keeps model setup
-  outside the Python dependency graph and avoids requiring cloud credentials.
+## Runtime Direction
+- The product direction is **private by default and portable across local or
+  gateway runtimes**. Ollama is the recommended path for Mac and workstation use
+  because it keeps model setup outside the Python dependency graph and avoids
+  requiring cloud credentials.
 - Cloud/deployed inference should go through the generic OpenAI-compatible
   backend, not a provider-specific happy path.
 - First-party model providers are intentionally limited to Ollama and generic
   OpenAI-compatible gateways. Do not add provider-specific token paths unless a
   new product decision makes that tradeoff explicit.
-- New AI Loop Engine features should work through the local Ollama path first
+- New Loopwright features should work through the local Ollama path first
   and the OpenAI-compatible deployment path second.
 - On Apple Silicon, keep generation and embeddings outside this Python process
   by using Ollama; mock mode keeps built-in hashing only for deterministic
@@ -359,7 +363,7 @@ measurably honest, bigger agent features will only make the failure harder to se
 ### Framework Adapter Strategy
 
 Frameworks are interop surfaces, not the engine. The current plan is to export
-AI Loop Engine reports into framework-shaped artifacts before adding any live
+Loopwright reports into framework-shaped artifacts before adding any live
 framework runtime integration:
 
 - OpenAI Agents SDK: trace-shaped export, dependency-free in

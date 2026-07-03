@@ -433,6 +433,54 @@ def test_app_main_allows_explicit_non_loopback_host(monkeypatch):
     assert observed["port"] == 8799
 
 
+def test_thread_store_path_prefers_loopwright_env(monkeypatch, tmp_path):
+    new_path = tmp_path / "loopwright.sqlite3"
+    old_path = tmp_path / "legacy.sqlite3"
+    monkeypatch.setenv("LOOPWRIGHT_THREAD_DB_PATH", str(new_path))
+    monkeypatch.setenv("AI_LOOP_THREAD_DB_PATH", str(old_path))
+
+    assert web_app.default_thread_store_path() == new_path
+
+
+def test_thread_store_path_accepts_legacy_ai_loop_env(monkeypatch, tmp_path):
+    legacy_path = tmp_path / "legacy.sqlite3"
+    monkeypatch.delenv("LOOPWRIGHT_THREAD_DB_PATH", raising=False)
+    monkeypatch.setenv("AI_LOOP_THREAD_DB_PATH", str(legacy_path))
+
+    assert web_app.default_thread_store_path() == legacy_path
+
+
+def test_thread_store_path_uses_legacy_default_when_new_default_missing(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("LOOPWRIGHT_THREAD_DB_PATH", raising=False)
+    monkeypatch.delenv("AI_LOOP_THREAD_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    legacy_default = tmp_path / ".ai-loop-engine" / "threads.sqlite3"
+    legacy_default.parent.mkdir()
+    legacy_default.write_bytes(b"legacy sqlite placeholder")
+
+    assert web_app.default_thread_store_path() == legacy_default
+
+
+def test_thread_store_path_prefers_loopwright_default_when_present(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("LOOPWRIGHT_THREAD_DB_PATH", raising=False)
+    monkeypatch.delenv("AI_LOOP_THREAD_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    legacy_default = tmp_path / ".ai-loop-engine" / "threads.sqlite3"
+    new_default = tmp_path / ".loopwright" / "threads.sqlite3"
+    legacy_default.parent.mkdir()
+    new_default.parent.mkdir()
+    legacy_default.write_bytes(b"legacy sqlite placeholder")
+    new_default.write_bytes(b"new sqlite placeholder")
+
+    assert web_app.default_thread_store_path() == new_default
+
+
 def test_static_frontend_is_served():
     client = TestClient(web_app.create_app(FakeQA()))
 
@@ -442,7 +490,7 @@ def test_static_frontend_is_served():
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert "AI Loop Engine" in response.text
+    assert "Loopwright" in response.text
     assert "Model status" in response.text
     assert "backend-pill" in response.text
     assert "model-pill" in response.text
@@ -1006,7 +1054,7 @@ const recipes = [{
 globalThis.fetch = async (url, options = {}) => {
   const method = String(options.method || "GET").toUpperCase();
   if (url === "/api/config") {
-    return jsonResponse({ title: "AI Loop Engine" });
+    return jsonResponse({ title: "Loopwright" });
   }
   if (url === "/api/status") {
     return jsonResponse({
@@ -1572,7 +1620,7 @@ await tick();
 assert.equal(nodeText(dom["thread-list"]).includes("Delete me"), false);
 assert.ok(nodeText(dom["thread-list"]).includes("Keep me"));
 assert.equal(dom["active-thread-title"].textContent, "Keep me");
-assert.equal(globalThis.localStorage.getItem("ai-loop-engine.active-thread.v1"), "thread_keep");
+assert.equal(globalThis.localStorage.getItem("loopwright.active-thread.v1"), "thread_keep");
 assert.deepEqual(detailFetches, ["thread_delete", "thread_keep"]);
 assert.equal(dom["query-button"].disabled, false);
 
@@ -1583,7 +1631,7 @@ assert.equal(createdCount, 1);
 assert.equal(serverThreads.length, 1);
 assert.equal(serverThreads[0].id, "thread_created_1");
 assert.equal(dom["active-thread-title"].textContent, "New thread");
-assert.equal(globalThis.localStorage.getItem("ai-loop-engine.active-thread.v1"), "thread_created_1");
+assert.equal(globalThis.localStorage.getItem("loopwright.active-thread.v1"), "thread_created_1");
 assert.equal(dom["delete-thread"].disabled, false);
 assert.equal(nodeText(dom["thread-list"]).includes("Keep me"), false);
 '''
@@ -2142,7 +2190,7 @@ globalThis.fetch = async (url, options = {}) => {
   }
   if (url === "/api/recipes/recipe_custom/export" && method === "GET") {
     requests.exported.push(url);
-    return jsonResponse({ ...recipes.find((recipe) => recipe.recipe_id === "recipe_custom"), exported_from: "AI Loop Engine" });
+    return jsonResponse({ ...recipes.find((recipe) => recipe.recipe_id === "recipe_custom"), exported_from: "Loopwright" });
   }
   if (url === "/api/recipes/recipe_custom" && method === "DELETE") {
     requests.deleted.push(url);
@@ -2182,7 +2230,7 @@ assert.equal(exportedRecipe.recipe_id, "recipe_custom");
 assert.equal(exportedRecipe.instructions, "Be sharp.");
 assert.deepEqual(exportedRecipe.success_criteria, ["Names risk."]);
 assert.deepEqual(exportedRecipe.metadata, { source: "test" });
-assert.equal(exportedRecipe.exported_from, "AI Loop Engine");
+assert.equal(exportedRecipe.exported_from, "Loopwright");
 assert.ok(dom["recipe-status"].textContent.includes("Exported Custom reviewer"));
 await dom["recipe-delete"].dispatch("click");
 assert.equal(deleteConfirmed, true);
@@ -2212,7 +2260,7 @@ def test_config_and_status_endpoints_return_runtime_contract():
     config = client.get("/api/config").json()
     status = client.get("/api/status").json()
 
-    assert config["title"] == "AI Loop Engine"
+    assert config["title"] == "Loopwright"
     assert {"label": "Auto", "value": "auto"} in config["text_encodings"]
     assert status["active_document"] is None
     assert status["backend"] == "mock"
@@ -2795,7 +2843,7 @@ def test_query_endpoint_refreshes_stale_builtin_default_recipe():
     stale_default = LoopRecipe(
         recipe_id=DEFAULT_LOOP_RECIPE_ID,
         name="General assistant loop",
-        description="Default local-first loop behavior.",
+        description="Default evidence loop behavior.",
         goal="Answer using indexed context.",
         instructions="Use indexed context when present.",
         success_criteria=("Uses indexed context.",),
@@ -2890,7 +2938,7 @@ def test_recipe_endpoints_manage_loop_recipes():
     exported = client.get(f"/api/recipes/{recipe_id}/export")
     assert exported.status_code == 200
     assert exported.json()["recipe_id"] == recipe_id
-    assert exported.json()["exported_from"] == "AI Loop Engine"
+    assert exported.json()["exported_from"] == "Loopwright"
 
     duplicate = client.post(
         "/api/recipes",
