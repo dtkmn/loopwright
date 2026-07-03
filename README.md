@@ -520,7 +520,7 @@ ollama stop qwen3:8b
 - `AGENTS.md` contains repo-level instructions for coding agents: setup commands,
   validation expectations, backend honesty rules, encoding policy, and release
   guardrails.
-- `.agents/skills/document-qa/SKILL.md` defines the focused loop-engineering
+- `.agents/skills/loop-engineering/SKILL.md` defines the focused loop-engineering
   skill for changes to loop contracts, evidence context, retrieval, model
   routing, UI status, evals, and CI publishing.
 - Use the documented loop for non-trivial changes: explore, plan, act, observe,

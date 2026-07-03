@@ -140,7 +140,7 @@ not a new execution engine.
 ### Non-Goals
 
 - Do not implement a LangGraph `BaseCheckpointSaver` yet.
-- Do not compile the current document QA flow into a `StateGraph` yet.
+- Do not compile the current evidence-backed answer loop into a `StateGraph` yet.
 - Do not introduce LangSmith/LangGraph deployment assumptions.
 - Do not treat LangGraph stores as our memory model before AI Loop Engine has a
   real cross-session memory product.

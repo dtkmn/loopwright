@@ -125,9 +125,9 @@ evidence providers; none of them is the whole product boundary.
   and drop/redact it for refused, blocked, or terminal-public-redacted results.
   GPT-OSS thinking must use `OLLAMA_THINK_LEVEL` with `low`, `medium`,
   or `high`; boolean `think` values are ignored by that model family.
-- Golden document evals must exercise the full provider-free QA loop: upload,
-  retrieval, cited answer, self-check, retry, and fail-closed refusal. Do not
-  require a live Ollama backend for these CI checks.
+- Golden evidence evals must exercise the full provider-free answer loop:
+  upload, retrieval, cited answer, self-check, retry, and fail-closed refusal.
+  Do not require a live Ollama backend for these CI checks.
 - `src.loop_eval --mode fake` is the provider-free CLI surface for JSON loop
   eval artifacts. It should include scored `LoopReport` evidence so humans can
   inspect phases, citations, verifier decisions, retries, refusals, and final
