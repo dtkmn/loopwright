@@ -321,6 +321,94 @@ SMART_CONTEXT_FILE_REFERENCE_HINTS = (
     "does it",
     "is it",
 )
+SMART_CONTEXT_FILE_FACT_TERMS = frozenset(
+    {
+        "address",
+        "amount",
+        "author",
+        "budget",
+        "cost",
+        "date",
+        "deadline",
+        "decision",
+        "decisions",
+        "deliverable",
+        "deliverables",
+        "due",
+        "goal",
+        "goals",
+        "launch",
+        "milestone",
+        "milestones",
+        "objective",
+        "objectives",
+        "owner",
+        "owners",
+        "recommendation",
+        "recommendations",
+        "release",
+        "requirement",
+        "requirements",
+        "risk",
+        "risks",
+        "schedule",
+        "status",
+        "target",
+        "timeline",
+        "version",
+    }
+)
+SMART_CONTEXT_FILE_FACT_QUESTION_TERMS = frozenset(
+    {
+        "give",
+        "list",
+        "many",
+        "much",
+        "provide",
+        "show",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+    }
+)
+SMART_CONTEXT_FILE_FACT_WEB_OVERRIDE_HINTS = (
+    "latest",
+    "current",
+    "today",
+    "right now",
+    "now",
+    "recent",
+    "news",
+    "search",
+    "web",
+    "internet",
+    "online",
+    "2026",
+    "as of",
+)
+SMART_CONTEXT_FILE_FACT_DIRECT_OVERRIDE_HINTS = (
+    "rewrite",
+    "draft",
+    "edit",
+    "translate",
+    "review this",
+    "improve this",
+    "fix this",
+    "debug",
+    "write code",
+    "fix this code",
+    "debug this code",
+    "write a function",
+    "create a function",
+    "implement",
+    "stack trace",
+    "error message",
+    "brainstorm",
+    "compose",
+    "generate",
+)
 SMART_CONTEXT_FILE_TOKEN_STOPWORDS = frozenset(
     {
         "a",
@@ -1997,6 +2085,11 @@ class AILoopEngine:
             active_state,
         ):
             return "document"
+        if active_state.retrieval_chain and self._question_asks_active_file_fact(
+            question,
+            active_state,
+        ):
+            return "document"
         if self._should_use_direct_context(question):
             return "none"
         if self._should_use_web_context(
@@ -2042,6 +2135,49 @@ class AILoopEngine:
             for document in documents[:12]
         )
         return any(token in sampled_text for token in query_tokens)
+
+    def _question_asks_active_file_fact(
+        self, question: str, active_state: ActiveDocumentState
+    ) -> bool:
+        normalized = " ".join(str(question or "").casefold().split())
+        if not normalized:
+            return False
+        if any(hint in normalized for hint in SMART_CONTEXT_FILE_FACT_WEB_OVERRIDE_HINTS):
+            return False
+        if any(
+            hint in normalized for hint in SMART_CONTEXT_FILE_FACT_DIRECT_OVERRIDE_HINTS
+        ):
+            return False
+        question_tokens = {
+            token
+            for token in re.findall(r"\w+", normalized, flags=re.UNICODE)
+            if token
+        }
+        if not question_tokens & SMART_CONTEXT_FILE_FACT_QUESTION_TERMS:
+            return False
+        if not question_tokens & SMART_CONTEXT_FILE_FACT_TERMS:
+            return False
+        return self._active_file_contains_question_tokens(question_tokens, active_state)
+
+    def _active_file_contains_question_tokens(
+        self, question_tokens: set[str], active_state: ActiveDocumentState
+    ) -> bool:
+        query_tokens = {
+            token
+            for token in question_tokens
+            if len(token) >= 3 and token not in SMART_CONTEXT_FILE_TOKEN_STOPWORDS
+        }
+        if not query_tokens:
+            return False
+        document_name = str(active_state.document_name or "").casefold()
+        if any(token in document_name for token in query_tokens):
+            return True
+        documents = getattr(active_state.vector_store, "documents", None) or []
+        for document in documents:
+            content = str(getattr(document, "page_content", "") or "").casefold()
+            if any(token in content for token in query_tokens):
+                return True
+        return False
 
     def _question_mentions_active_file_entity(
         self, question: str, active_state: ActiveDocumentState
@@ -2665,7 +2801,7 @@ class AILoopEngine:
             loop_recipe,
         )
         return (
-            "You are AI Loop Engine running without an external context provider. "
+            "You are Loopwright running without an external context provider. "
             "Answer the user's current question directly. Match the depth the "
             "user asks for: give a fuller step-by-step explanation when they "
             "ask for detail, and keep simple yes/no or factual answers brief. "

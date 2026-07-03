@@ -6,7 +6,7 @@ Date: 2026-06-24.
 
 ## Purpose
 
-AI Loop Engine should interoperate with current agent frameworks without letting
+Loopwright should interoperate with current agent frameworks without letting
 any framework become the core product architecture. The internal contract remains
 `LoopReport`, `LoopSession`, provider-neutral phases, explicit verifier
 decisions, guardrail decisions, and local replay artifacts.
@@ -60,12 +60,12 @@ unless that capture is disabled.
 
 ### Mapping
 
-| AI Loop Engine | OpenAI Trace Concept | Notes |
+| Loopwright | OpenAI Trace Concept | Notes |
 | --- | --- | --- |
 | `LoopSession.session_id` | trace `group_id` | Groups related runs in one conversation/session. |
 | `LoopRun.run_id` | trace metadata and/or trace id suffix | Preserve the internal id; do not require OpenAI id format internally. |
 | `LoopRun.context_provider` | trace metadata | Resolved provider, for example `document`, `web`, or `none`; requested provider metadata may be `smart` or legacy `auto`. |
-| `LoopStep.phase=context_select/retrieve` | custom span | These are AI Loop Engine-specific context phases. |
+| `LoopStep.phase=context_select/retrieve` | custom span | These are Loopwright-specific context phases. |
 | `LoopStep.phase=draft` | generation-like span or custom span | Use generation span only if OpenAI SDK data shape can represent the model call honestly. |
 | `LoopStep.phase=format_check` | custom span | Presentation/readability gate, not evidence verification. |
 | `LoopStep.phase=mechanical_check` | custom span | Deterministic check, not model generation. |
@@ -108,7 +108,7 @@ data across threads.
 
 ### Mapping
 
-| AI Loop Engine | LangGraph Concept | Notes |
+| Loopwright | LangGraph Concept | Notes |
 | --- | --- | --- |
 | `LoopSession.session_id` | `thread_id` | Direct conceptual match. |
 | `LoopRun` | one graph invocation or checkpoint sequence | Keep `run_id` as metadata. |
@@ -140,9 +140,9 @@ not a new execution engine.
 ### Non-Goals
 
 - Do not implement a LangGraph `BaseCheckpointSaver` yet.
-- Do not compile the current document QA flow into a `StateGraph` yet.
+- Do not compile the current evidence-backed answer loop into a `StateGraph` yet.
 - Do not introduce LangSmith/LangGraph deployment assumptions.
-- Do not treat LangGraph stores as our memory model before AI Loop Engine has a
+- Do not treat LangGraph stores as our memory model before Loopwright has a
   real cross-session memory product.
 
 ## Microsoft Agent Framework Adapter
@@ -157,9 +157,9 @@ at superstep boundaries.
 
 ### Mapping
 
-| AI Loop Engine | Microsoft Agent Framework Concept | Notes |
+| Loopwright | Microsoft Agent Framework Concept | Notes |
 | --- | --- | --- |
-| `LoopRun` | workflow run result | One AI Loop Engine run maps to one workflow execution record. |
+| `LoopRun` | workflow run result | One Loopwright run maps to one workflow execution record. |
 | `LoopStep.phase` | executor event or custom event | Keep phase names as custom event discriminators first. |
 | `LoopStep.started_at/ended_at` | event timing metadata | Microsoft events are streaming-oriented; our report is completed-run oriented. |
 | `LoopDecision.REQUIRES_REVIEW` | `request_info` event | Natural match for future human-review/tool-approval paths. |
@@ -180,7 +180,7 @@ importing the framework or committing to its workflow execution model.
 
 ### Non-Goals
 
-- Do not wrap AI Loop Engine as a Microsoft `Workflow` yet.
+- Do not wrap Loopwright as a Microsoft `Workflow` yet.
 - Do not turn loop phases into real executors until tool and human-review
   boundaries are stronger.
 - Do not use Microsoft checkpoint storage as the source of truth for session
@@ -269,5 +269,5 @@ Recommended order:
    manifest, not a LangGraph runtime integration.
 5. Add Microsoft event-stream export third.
 
-The product should remain AI Loop Engine. Frameworks are export targets and
+The product should remain Loopwright. Frameworks are export targets and
 interop layers, not the engine.

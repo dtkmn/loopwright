@@ -1138,7 +1138,7 @@ def test_smart_web_verifier_failure_falls_back_to_unverified_direct_answer():
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 return (
                     "Loop engineering means designing and inspecting the repeated "
                     "AI workflow around context, drafting, checking, retrying, and "
@@ -1209,7 +1209,7 @@ def test_smart_web_mechanical_failure_does_not_fallback_to_direct_answer():
         last_thinking = None
 
         def invoke(self, prompt):
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise AssertionError(
                     "mechanical citation failure must not fallback to direct answer"
                 )
@@ -1262,7 +1262,7 @@ def test_smart_web_verifier_failure_with_broken_direct_fallback_returns_safe_err
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise RuntimeError("DIRECT_MODEL_SECRET_FAILURE")
             return "SECRET_REJECTED_WEB_DRAFT is not supported enough [1]."
 
@@ -1333,7 +1333,7 @@ def test_explicit_web_verifier_failure_does_not_fallback_to_direct_answer():
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise AssertionError("explicit web must not fallback to direct answer")
             return "Loop engineering is a complete agent architecture pattern [1]."
 
@@ -1369,7 +1369,7 @@ def test_smart_web_search_failure_falls_back_to_unverified_direct_answer():
         invoke=lambda prompt: (
             "I can explain loop engineering from model knowledge, but this "
             "answer is not verified by web evidence."
-            if prompt.startswith("You are AI Loop Engine running without")
+            if prompt.startswith("You are Loopwright running without")
             else "unexpected"
         ),
         last_thinking=None,
@@ -1410,7 +1410,7 @@ def test_smart_web_search_failure_with_broken_direct_fallback_returns_safe_error
         last_thinking = None
 
         def invoke(self, prompt):
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 raise RuntimeError("DIRECT_MODEL_SECRET_FAILURE")
             return "unexpected"
 
@@ -1507,7 +1507,7 @@ def test_smart_web_terminal_fallback_errors_redact_draft_outputs(
                 return json.dumps(
                     {"outcome": "insufficient", "reason": "snippet too thin"}
                 )
-            if prompt.startswith("You are AI Loop Engine running without"):
+            if prompt.startswith("You are Loopwright running without"):
                 if expected_error == "empty_direct_answer":
                     self.last_thinking = "SECRET_EMPTY_FALLBACK_THINKING"
                 return fallback_answer
@@ -1698,6 +1698,86 @@ def test_smart_context_provider_uses_active_file_when_available(tmp_path):
     assert result.loop_report.run.context_provider == "document"
     assert result.loop_report.run.metadata["requested_context_provider"] == "smart"
     assert result.loop_report.run.metadata["document_name"] == "phoenix.txt"
+
+
+def test_smart_context_provider_uses_active_file_for_short_fact_question(tmp_path):
+    class FailingWebSearchClient:
+        def search(self, query, *, max_results=5):
+            raise AssertionError("doc fact question must not be sent to web search")
+
+    document = tmp_path / "strategy.txt"
+    document.write_text(
+        "The launch date is June 2026. The owner is Nadia.",
+        encoding="utf-8",
+    )
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+    qa.process_document(str(document))
+    qa.web_search_client = FailingWebSearchClient()
+
+    result = qa.query_with_trace(
+        "What is the launch date?",
+        session_id="smart_short_file_fact",
+    )
+
+    assert "June 2026" in result.answer
+    assert result.loop_report.run.context_provider == "document"
+    assert result.loop_report.run.metadata["requested_context_provider"] == "smart"
+    assert result.loop_report.run.metadata["document_name"] == "strategy.txt"
+    assert result.trace.document_name == "strategy.txt"
+    assert result.trace.citations
+
+
+def test_smart_context_provider_uses_active_file_for_late_chunk_fact_question(tmp_path):
+    class FailingWebSearchClient:
+        def search(self, query, *, max_results=5):
+            raise AssertionError("late doc fact question must not be sent to web search")
+
+    class FactEmbeddings(Embeddings):
+        def embed_documents(self, texts):
+            return [self._embed(text) for text in texts]
+
+        def embed_query(self, text):
+            return self._embed(text)
+
+        def _embed(self, text):
+            lower = text.lower()
+            return [
+                float("launch" in lower),
+                float("date" in lower),
+                float("june" in lower),
+            ]
+
+    filler_sections = [
+        (
+            f"Background section {index}. "
+            "This unrelated planning note discusses staffing, onboarding, and tooling."
+        )
+        for index in range(20)
+    ]
+    document = tmp_path / "strategy.txt"
+    document.write_text(
+        "\n\n".join(filler_sections)
+        + "\n\nThe launch date is June 2026. The owner is Nadia.",
+        encoding="utf-8",
+    )
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+    qa.embeddings = FactEmbeddings()
+    qa.profile["splitter_chunk_size"] = 90
+    qa.profile["splitter_chunk_overlap"] = 0
+    qa.process_document(str(document))
+    qa.web_search_client = FailingWebSearchClient()
+
+    assert len(qa.vector_store.documents) > 12
+
+    result = qa.query_with_trace(
+        "What is the launch date?",
+        session_id="smart_late_file_fact",
+    )
+
+    assert "June 2026" in result.answer
+    assert result.loop_report.run.context_provider == "document"
+    assert result.loop_report.run.metadata["document_name"] == "strategy.txt"
+    assert result.trace.citations
 
 
 def test_smart_context_provider_ignores_active_file_without_file_intent(tmp_path):
@@ -2606,6 +2686,43 @@ def test_smart_context_provider_current_public_entity_mention_still_uses_web(tmp
     assert result.loop_report.run.metadata["document_name"] is None
 
 
+def test_smart_context_provider_current_public_fact_lookup_still_uses_web(tmp_path):
+    class FakeWebSearchClient:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, query, *, max_results=5):
+            self.calls.append((query, max_results))
+            return [
+                web_search_module.WebSearchHit(
+                    title="Python release date",
+                    url="https://example.com/python-release-date",
+                    snippet="The current Python release date should come from web evidence.",
+                )
+            ]
+
+    document = tmp_path / "notes.txt"
+    document.write_text(
+        "These notes mention Python and an old release date as examples.",
+        encoding="utf-8",
+    )
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+    qa.process_document(str(document))
+    qa.web_search_client = FakeWebSearchClient()
+
+    result = qa.query_with_trace(
+        "What is the current Python release date?",
+        session_id="smart_current_public_fact_web",
+    )
+
+    assert qa.web_search_client.calls == [
+        ("What is the current Python release date?", qa.web_search_max_results)
+    ]
+    assert result.loop_report.run.context_provider == "web"
+    assert result.loop_report.run.metadata["requested_context_provider"] == "smart"
+    assert result.loop_report.run.metadata["document_name"] is None
+
+
 @pytest.mark.parametrize(
     ("document_text", "question", "title"),
     [
@@ -3117,6 +3234,36 @@ def test_smart_context_provider_keeps_private_local_tasks_off_active_file(tmp_pa
     )
 
     assert result.answer == "Rewritten private draft."
+    assert result.loop_report.run.context_provider == "none"
+    assert result.loop_report.run.metadata["requested_context_provider"] == "smart"
+    assert result.loop_report.run.metadata["document_name"] is None
+    assert result.trace.citations == []
+
+
+def test_smart_context_provider_keeps_draft_tasks_off_active_file(tmp_path):
+    class FailingWebSearchClient:
+        def search(self, query, *, max_results=5):
+            raise AssertionError("draft task must not be sent to web search")
+
+    document = tmp_path / "strategy.txt"
+    document.write_text(
+        "The launch email date is June 2026.",
+        encoding="utf-8",
+    )
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+    qa.process_document(str(document))
+    qa.web_search_client = FailingWebSearchClient()
+    qa.llm = SimpleNamespace(
+        invoke=lambda _prompt: "Drafted launch email.",
+        last_thinking=None,
+    )
+
+    result = qa.query_with_trace(
+        "Show me a draft for the launch email.",
+        session_id="smart_draft_with_file",
+    )
+
+    assert result.answer == "Drafted launch email."
     assert result.loop_report.run.context_provider == "none"
     assert result.loop_report.run.metadata["requested_context_provider"] == "smart"
     assert result.loop_report.run.metadata["document_name"] is None

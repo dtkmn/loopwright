@@ -18,7 +18,7 @@ except ImportError:
 
 DUCKDUCKGO_INSTANT_ANSWER_URL = "https://api.duckduckgo.com/"
 DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/"
-WEB_SEARCH_USER_AGENT = "AI-Loop-Engine/0.1 (+local-first evidence retrieval)"
+WEB_SEARCH_USER_AGENT = "Loopwright/0.1 (+evidence retrieval)"
 WEB_SEARCH_HTML_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
@@ -459,7 +459,7 @@ class WebSearchRetrievalChain:
         self, *, question: str, context: str, self_check_instruction: str = ""
     ) -> str:
         prompt = (
-            "You are AI Loop Engine answering with web search evidence. Use only "
+            "You are Loopwright answering with web search evidence. Use only "
             "the provided web search snippets as evidence. Cite supported claims "
             "inline with bracketed numbers like [1]. Web snippets are partial "
             "evidence; if the snippets are insufficient, say that clearly and do "

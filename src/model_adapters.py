@@ -1,4 +1,4 @@
-"""Model and embedding adapters for AI Loop Engine providers."""
+"""Model and embedding adapters for Loopwright providers."""
 
 import json
 import math

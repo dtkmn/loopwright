@@ -1,6 +1,6 @@
 ---
 name: loop-engineering
-description: Use when changing loop contracts, evidence context, retrieval, LLM backend routing, FastAPI/web upload/query behavior, evals, or CI release policy for AI Loop Engine.
+description: Use when changing loop contracts, evidence context, retrieval, LLM backend routing, FastAPI/web upload/query behavior, evals, or CI release policy for Loopwright.
 ---
 
 # Loop Engineering
@@ -8,7 +8,7 @@ description: Use when changing loop contracts, evidence context, retrieval, LLM 
 ## Purpose
 
 Use this skill to evolve the workbench without weakening its core promise: make
-agent loops observable, testable, local-first, and honest. Smart Evidence,
+agent loops observable, testable, private by default, and honest. Smart Evidence,
 web snippets, uploaded files, thread memory, and direct model knowledge are
 evidence providers; none of them is the whole product boundary.
 
@@ -29,7 +29,7 @@ evidence providers; none of them is the whole product boundary.
 
 ## Runtime Contracts
 
-- `auto` backend is local-first and real-backend-only: select Ollama and fail
+- `auto` backend is local-runtime and real-backend-only: select Ollama and fail
   closed when Ollama or the configured model is unavailable. It must not fall
   back to mock.
 - Ollama runtime URLs must be loopback local only. Remote/cloud model gateways
@@ -61,7 +61,7 @@ evidence providers; none of them is the whole product boundary.
   hashing for deterministic demos/tests.
 - `LLM_BACKEND=auto` must select Ollama only. It must not silently select mock,
   provider-specific hosted backends, or in-process model loading.
-- Product identity is AI Loop Engine. Treat uploaded-file answering and web
+- Product identity is Loopwright. Treat uploaded-file answering and web
   evidence as context provider capabilities, not the repo's strategic identity.
 - File and web evidence are `ContextProvider`-shaped capabilities; keep
   provider identity in loop reports instead of hardcoding document-specific
@@ -125,9 +125,9 @@ evidence providers; none of them is the whole product boundary.
   and drop/redact it for refused, blocked, or terminal-public-redacted results.
   GPT-OSS thinking must use `OLLAMA_THINK_LEVEL` with `low`, `medium`,
   or `high`; boolean `think` values are ignored by that model family.
-- Golden document evals must exercise the full provider-free QA loop: upload,
-  retrieval, cited answer, self-check, retry, and fail-closed refusal. Do not
-  require a live Ollama backend for these CI checks.
+- Golden evidence evals must exercise the full provider-free answer loop:
+  upload, retrieval, cited answer, self-check, retry, and fail-closed refusal.
+  Do not require a live Ollama backend for these CI checks.
 - `src.loop_eval --mode fake` is the provider-free CLI surface for JSON loop
   eval artifacts. It should include scored `LoopReport` evidence so humans can
   inspect phases, citations, verifier decisions, retries, refusals, and final

@@ -1,4 +1,4 @@
-"""Runtime configuration helpers for AI Loop Engine.
+"""Runtime configuration helpers for Loopwright.
 
 This module owns provider-neutral environment names, defaults, URL validation,
 and safe display helpers. Keep it free of native-heavy imports so entrypoints

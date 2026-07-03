@@ -1,4 +1,4 @@
-"""Dependency-free framework adapter exports for AI Loop Engine."""
+"""Dependency-free framework adapter exports for Loopwright."""
 
 from .base import LoopReportAdapter
 from .langgraph_manifest import LangGraphManifestAdapter

@@ -148,9 +148,9 @@ def test_export_report_maps_loop_report_to_langgraph_manifest_shape():
         "Project Phoenix launches in June 2026 [1]."
     )
     assert [checkpoint["checkpoint_ns"] for checkpoint in manifest["checkpoints"]] == [
-        "ai_loop_engine",
-        "ai_loop_engine",
-        "ai_loop_engine",
+        "loopwright",
+        "loopwright",
+        "loopwright",
     ]
     assert manifest["checkpoints"][1]["node"] == "draft"
     assert manifest["checkpoints"][1]["state"]["output_summary"].startswith(

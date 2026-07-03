@@ -1,4 +1,4 @@
-"""AI Loop Engine package."""
+"""Loopwright package."""
 
 __all__ = ["AILoopEngine"]
 

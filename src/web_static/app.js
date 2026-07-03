@@ -1,11 +1,14 @@
-const ACTIVE_THREAD_STORAGE_KEY = "ai-loop-engine.active-thread.v1";
-const ACTIVE_RECIPE_STORAGE_KEY = "ai-loop-engine.active-recipe.v1";
+const ACTIVE_THREAD_STORAGE_KEY = "loopwright.active-thread.v1";
+const ACTIVE_RECIPE_STORAGE_KEY = "loopwright.active-recipe.v1";
+const LEGACY_ACTIVE_THREAD_STORAGE_KEY = "ai-loop-engine.active-thread.v1";
+const LEGACY_ACTIVE_RECIPE_STORAGE_KEY = "ai-loop-engine.active-recipe.v1";
 const LEGACY_THREAD_STORAGE_KEY = "ai-loop-engine.threads.v1";
 const DEFAULT_THREAD_TITLE = "New thread";
 const MAX_THREADS = 30;
 const MAX_THREAD_MESSAGES = 100;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/;
 const QUERY_PROGRESS_INTERVAL_MS = 1000;
+const DEFAULT_TEXT_ENCODING = "auto";
 
 const state = {
   threads: [],
@@ -22,7 +25,6 @@ const elements = {
   backendPill: document.querySelector("#backend-pill"),
   modelPill: document.querySelector("#model-pill"),
   readyPill: document.querySelector("#ready-pill"),
-  uploadForm: document.querySelector("#upload-form"),
   uploadButton: document.querySelector("#upload-button"),
   uploadStatus: document.querySelector("#upload-status"),
   fileInput: document.querySelector("#document-file"),
@@ -47,8 +49,8 @@ const elements = {
   recipeStop: document.querySelector("#recipe-stop"),
   activeThreadTitle: document.querySelector("#active-thread-title"),
   activeThreadMemory: document.querySelector("#active-thread-memory"),
+  fileScope: document.querySelector("#file-scope"),
   refreshStatus: document.querySelector("#refresh-status"),
-  runtimeGrid: document.querySelector("#runtime-grid"),
   queryForm: document.querySelector("#query-form"),
   queryContext: document.querySelector("#query-context"),
   queryInput: document.querySelector("#query-input"),
@@ -520,13 +522,19 @@ function legacyActiveThreadId() {
 
 function loadActiveThreadId() {
   const activeId = String(
-    globalThis.localStorage?.getItem(ACTIVE_THREAD_STORAGE_KEY) || "",
+    globalThis.localStorage?.getItem(ACTIVE_THREAD_STORAGE_KEY) ||
+      globalThis.localStorage?.getItem(LEGACY_ACTIVE_THREAD_STORAGE_KEY) ||
+      "",
   );
   return activeId || legacyActiveThreadId();
 }
 
 function loadActiveRecipeId() {
-  return String(globalThis.localStorage?.getItem(ACTIVE_RECIPE_STORAGE_KEY) || "");
+  return String(
+    globalThis.localStorage?.getItem(ACTIVE_RECIPE_STORAGE_KEY) ||
+      globalThis.localStorage?.getItem(LEGACY_ACTIVE_RECIPE_STORAGE_KEY) ||
+      "",
+  );
 }
 
 function persistActiveThreadId() {
@@ -752,6 +760,9 @@ async function switchThread(threadId) {
   renderLoopPayload(
     runningPayloadForThread(threadId) || activeThread().latest || emptyLoopPayload(),
   );
+  await refreshStatus().catch((error) => {
+    elements.uploadStatus.textContent = error.message;
+  });
 }
 
 async function startNewThread() {
@@ -770,6 +781,9 @@ async function startNewThread() {
   renderMessages();
   renderRuns(thread.loopRuns);
   renderLoopPayload(emptyLoopPayload());
+  await refreshStatus().catch((error) => {
+    elements.uploadStatus.textContent = error.message;
+  });
   elements.queryInput.focus();
 }
 
@@ -825,6 +839,9 @@ async function deleteActiveThread() {
     renderMessages();
     renderRuns(activeThread().loopRuns);
     renderLoopPayload(activeThread().latest || emptyLoopPayload());
+    await refreshStatus().catch((error) => {
+      elements.uploadStatus.textContent = error.message;
+    });
     elements.uploadStatus.textContent = `Deleted thread "${title}".`;
   } catch (error) {
     await loadThreadDetail(threadId).catch(() => {});
@@ -848,32 +865,33 @@ async function deleteActiveThread() {
   }
 }
 
-function renderRuntimeStatus(status) {
-  elements.backendPill.textContent = status.backend || "unconfigured";
-  elements.modelPill.textContent = status.model || "model unavailable";
-  elements.readyPill.textContent = status.ready_for_queries ? "files indexed" : "smart evidence";
-  elements.readyPill.dataset.ready = String(Boolean(status.ready_for_queries));
-
-  const rows = [
-    ["Indexed files", status.active_document || "none"],
-    ["Evidence mode", "Smart Evidence"],
-    ["Last attempt", status.last_attempted_document || "none"],
-    ["Profile", status.profile || "unknown"],
-    ["Max output", status.max_output_tokens ? `${status.max_output_tokens} tokens` : "unknown"],
-    ["Embedding model", status.embeddings_model || "unknown"],
-    ["Chunks", status.chunk_count ?? 0],
-    ["Phase", status.phase || "idle"],
-    ["Last error", status.last_error || "none"],
-  ];
-
-  elements.runtimeGrid.replaceChildren();
-  for (const [label, value] of rows) {
-    const term = document.createElement("dt");
-    term.textContent = label;
-    const detail = document.createElement("dd");
-    detail.textContent = String(value);
-    elements.runtimeGrid.append(term, detail);
+function sessionFileMessage(status) {
+  const fileName = safeText(status?.active_document, "", 96);
+  const attemptedName = safeText(status?.last_attempted_document, "", 96);
+  const lastError = safeText(status?.last_error, "", 180);
+  if (lastError && attemptedName) {
+    return fileName
+      ? `Could not attach ${attemptedName}. ${fileName} remains attached to this session.`
+      : `Could not attach ${attemptedName}. No file is attached to this session.`;
   }
+  if (fileName) {
+    return `${fileName} is attached to this session.`;
+  }
+  return "No file attached to this session.";
+}
+
+function renderRuntimeStatus(status, { uploadMessage = "" } = {}) {
+  const fileName = safeText(status?.active_document, "", 96);
+  elements.backendPill.textContent = safeText(status?.backend, "backend", 48);
+  elements.modelPill.textContent = safeText(status?.model, "model unavailable", 72);
+  elements.readyPill.textContent = fileName ? "file attached" : "no file";
+  elements.readyPill.dataset.ready = String(Boolean(fileName));
+  elements.fileScope.textContent = fileName || "No file attached";
+  elements.uploadStatus.textContent = uploadMessage || sessionFileMessage(status);
+}
+
+function uploadStillMatchesActiveThread(threadId) {
+  return state.activeThreadId === threadId && !state.deletingThreadIds.has(threadId);
 }
 
 function renderMessages() {
@@ -882,7 +900,7 @@ function renderMessages() {
   if (!messages.length) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
-    empty.textContent = "Ask anything. Add files only when you need file-grounded evidence.";
+    empty.textContent = "No messages yet.";
     elements.messages.append(empty);
     return;
   }
@@ -1269,17 +1287,6 @@ function renderLoopPayload(payload) {
   elements.traceJson.textContent = JSON.stringify(payload.trace, null, 2);
 }
 
-async function loadConfig() {
-  const config = await requestJson("/api/config");
-  elements.textEncoding.replaceChildren();
-  for (const option of config.text_encodings) {
-    const node = document.createElement("option");
-    node.value = option.value;
-    node.textContent = option.label;
-    elements.textEncoding.append(node);
-  }
-}
-
 async function loadRecipes() {
   const payload = await requestJson("/api/recipes");
   state.recipes = Array.isArray(payload?.recipes)
@@ -1554,37 +1561,68 @@ async function importRecipe() {
 }
 
 async function refreshStatus() {
-  const status = await requestJson("/api/status");
+  const headers = {};
+  if (state.activeThreadId) {
+    headers["x-ai-loop-session-id"] = state.activeThreadId;
+  }
+  const status = await requestJson("/api/status", { headers });
   renderRuntimeStatus(status);
 }
 
+async function refreshStatusAfterStaleUpload() {
+  await refreshStatus();
+  elements.uploadStatus.textContent = "Active session changed; current file status refreshed.";
+}
+
 async function uploadDocument(event) {
-  event.preventDefault();
+  event?.preventDefault?.();
   const file = elements.fileInput.files[0];
   if (!file) {
     elements.uploadStatus.textContent = "Choose a file first.";
     return;
   }
 
+  const uploadThreadId = activeThread().id || "default";
   const formData = new FormData();
   formData.append("file", file);
-  formData.append("text_encoding", elements.textEncoding.value);
+  formData.append("text_encoding", elements.textEncoding?.value || DEFAULT_TEXT_ENCODING);
+  formData.append("session_id", uploadThreadId);
 
-  setBusy(elements.uploadButton, true, "Index File");
-  elements.uploadStatus.textContent = "Indexing file...";
+  setBusy(elements.uploadButton, true, "Attach File");
+  elements.uploadStatus.textContent = "Attaching file to this session...";
   try {
     const result = await requestJson("/api/documents", {
       method: "POST",
       body: formData,
     });
-    elements.uploadStatus.textContent = result.message;
-    renderRuntimeStatus(result.status);
+    if (uploadStillMatchesActiveThread(uploadThreadId)) {
+      renderRuntimeStatus(result.status, {
+        uploadMessage: sessionFileMessage(result.status),
+      });
+    } else {
+      await refreshStatusAfterStaleUpload().catch((refreshError) => {
+        elements.uploadStatus.textContent = refreshError.message;
+      });
+    }
   } catch (error) {
-    elements.uploadStatus.textContent = error.message;
-    await refreshStatus().catch(() => {});
+    if (uploadStillMatchesActiveThread(uploadThreadId)) {
+      elements.uploadStatus.textContent = error.message;
+      await refreshStatus().catch(() => {});
+    } else {
+      await refreshStatusAfterStaleUpload().catch((refreshError) => {
+        elements.uploadStatus.textContent = refreshError.message;
+      });
+    }
   } finally {
-    setBusy(elements.uploadButton, false, "Index File");
+    setBusy(elements.uploadButton, false, "Attach File");
   }
+}
+
+function chooseDocumentFile() {
+  if (elements.uploadButton.disabled) {
+    return;
+  }
+  elements.fileInput.click();
 }
 
 async function runQuery(event) {
@@ -1790,7 +1828,8 @@ async function boot() {
   renderMessages();
   renderRuns(activeThread().loopRuns);
   renderLoopPayload(activeThread().latest || emptyLoopPayload());
-  elements.uploadForm.addEventListener("submit", uploadDocument);
+  elements.uploadButton.addEventListener("click", chooseDocumentFile);
+  elements.fileInput.addEventListener("change", uploadDocument);
   elements.queryForm.addEventListener("submit", runQuery);
   elements.newThreadButton.addEventListener("click", () =>
     startNewThread().catch((error) => {
@@ -1803,7 +1842,9 @@ async function boot() {
     }),
   );
   elements.clearButton.addEventListener("click", clearChat);
-  elements.refreshStatus.addEventListener("click", refreshStatus);
+  if (elements.refreshStatus) {
+    elements.refreshStatus.addEventListener("click", refreshStatus);
+  }
   elements.recipeSelect.addEventListener("change", () => {
     state.activeRecipeId = elements.recipeSelect.value;
     state.recipeDraft = null;
@@ -1820,7 +1861,6 @@ async function boot() {
   elements.recipeDeleteButton.addEventListener("click", deleteRecipe);
   elements.recipeExportButton.addEventListener("click", exportRecipe);
   elements.recipeImport.addEventListener("change", importRecipe);
-  await loadConfig();
   await refreshStatus();
 }
 

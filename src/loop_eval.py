@@ -397,7 +397,7 @@ def format_text_results(results: Sequence[LoopEvalRunResult]) -> str:
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(
         description=(
-            "Run AI Loop Engine golden evals and optionally write loop-report "
+            "Run Loopwright golden evals and optionally write loop-report "
             "JSON artifacts."
         )
     )

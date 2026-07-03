@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 try:
     from .env_file import load_local_env_files
@@ -81,7 +82,8 @@ MAX_SESSION_ID_LENGTH = 96
 MAX_QUERY_HISTORY_MESSAGES = 12
 MAX_SEMANTIC_MEMORY_MESSAGES = 4
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
-THREAD_DB_PATH_ENV = "AI_LOOP_THREAD_DB_PATH"
+THREAD_DB_PATH_ENV = "LOOPWRIGHT_THREAD_DB_PATH"
+LEGACY_THREAD_DB_PATH_ENV = "AI_LOOP_THREAD_DB_PATH"
 qa_system: Optional[AILoopEngine] = None
 thread_store_system: Optional[ThreadStore] = None
 
@@ -141,9 +143,15 @@ def get_engine() -> AILoopEngine:
 
 def default_thread_store_path() -> Path:
     configured_path = os.getenv(THREAD_DB_PATH_ENV)
+    if not configured_path:
+        configured_path = os.getenv(LEGACY_THREAD_DB_PATH_ENV)
     if configured_path:
         return Path(configured_path).expanduser()
-    return Path.home() / ".ai-loop-engine" / "threads.sqlite3"
+    new_default = Path.home() / ".loopwright" / "threads.sqlite3"
+    legacy_default = Path.home() / ".ai-loop-engine" / "threads.sqlite3"
+    if legacy_default.exists() and not new_default.exists():
+        return legacy_default
+    return new_default
 
 
 def get_thread_store() -> ThreadStore:
@@ -319,20 +327,88 @@ async def write_upload_file(upload: UploadFile, upload_path: Path) -> None:
 def create_app(
     engine: Optional[AILoopEngine] = None,
     thread_store: Optional[ThreadStore] = None,
+    engine_factory: Optional[Callable[[str], AILoopEngine]] = None,
 ) -> FastAPI:
+    if engine is not None and engine_factory is not None:
+        raise ValueError("Provide either engine or engine_factory, not both.")
+
     api = FastAPI(title=APP_TITLE)
     api.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
     resolved_thread_store = (
         thread_store
         if thread_store is not None
-        else (ThreadStore.in_memory() if engine is not None else None)
+        else (
+            ThreadStore.in_memory()
+            if engine is not None or engine_factory is not None
+            else None
+        )
     )
+    scoped_runtimes: dict[str, AILoopEngine] = {}
+    scoped_runtime_lock = threading.Lock()
 
-    def runtime() -> AILoopEngine:
-        return engine if engine is not None else get_engine()
+    def build_runtime(session_id: str) -> AILoopEngine:
+        if engine_factory is not None:
+            return engine_factory(session_id)
+        return AILoopEngine(fast_mode=env_flag("FAST_MODE", False))
 
-    def loaded_runtime() -> Optional[AILoopEngine]:
-        return engine if engine is not None else qa_system
+    def runtime(session_id: str = "default") -> AILoopEngine:
+        if engine is not None:
+            return engine
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            current_runtime = scoped_runtimes.get(safe_id)
+            if current_runtime is None:
+                current_runtime = build_runtime(safe_id)
+                scoped_runtimes[safe_id] = current_runtime
+            return current_runtime
+
+    def loaded_runtime(session_id: str = "default") -> Optional[AILoopEngine]:
+        if engine is not None:
+            return engine
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            return scoped_runtimes.get(safe_id)
+
+    def drop_runtime(
+        session_id: str,
+        *,
+        expected_runtime: Optional[AILoopEngine] = None,
+    ) -> None:
+        if engine is not None:
+            return
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            current_runtime = scoped_runtimes.get(safe_id)
+            if expected_runtime is None or current_runtime is expected_runtime:
+                scoped_runtimes.pop(safe_id, None)
+
+    def thread_instance_is_current(
+        session_id: str,
+        *,
+        expected_instance_id: str,
+    ) -> bool:
+        thread = threads().get_thread(session_id)
+        return (
+            thread is not None
+            and thread.instance_id == expected_instance_id
+        )
+
+    def stale_upload_response(
+        session_id: str,
+        *,
+        upload_runtime: Optional[AILoopEngine] = None,
+    ) -> JSONResponse:
+        if upload_runtime is not None:
+            drop_runtime(session_id, expected_runtime=upload_runtime)
+        return JSONResponse(
+            {
+                "detail": (
+                    "Thread changed before document upload completed. "
+                    "Please upload the file again in the active thread."
+                )
+            },
+            status_code=409,
+        )
 
     def threads() -> ThreadStore:
         return resolved_thread_store if resolved_thread_store is not None else get_thread_store()
@@ -385,8 +461,16 @@ def create_app(
         }
 
     @api.get("/api/status")
-    def status() -> dict:
-        return runtime_status_dict(runtime().status())
+    def status(request: Request, session_id: Optional[str] = None) -> dict:
+        requested_session_id = (
+            session_id
+            or request.headers.get("x-ai-loop-session-id")
+            or request.headers.get("x-session-id")
+        )
+        safe_id = safe_session_id(requested_session_id)
+        if requested_session_id and threads().get_thread(safe_id) is None:
+            raise HTTPException(status_code=404, detail="Thread not found.")
+        return runtime_status_dict(runtime(safe_id).status())
 
     @api.get("/api/threads")
     def list_threads() -> dict:
@@ -425,11 +509,12 @@ def create_app(
         deleted = threads().delete_thread(safe_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Thread not found.")
-        current_engine = loaded_runtime()
+        current_engine = loaded_runtime(safe_id)
         if current_engine is not None:
             if hasattr(current_engine, "clear_loop_session"):
                 current_engine.clear_loop_session(safe_id)
             clear_chat_history_for_session(current_engine, safe_id)
+        drop_runtime(safe_id)
         return {"deleted": True, "thread_id": safe_id}
 
     @api.get("/api/threads/{thread_id}/runs")
@@ -544,7 +629,18 @@ def create_app(
     async def upload_document(
         file: UploadFile = File(...),
         text_encoding: str = Form("auto"),
+        session_id: Optional[str] = Form(None),
     ) -> JSONResponse:
+        explicit_session_id = bool(str(session_id or "").strip())
+        safe_id = safe_session_id(session_id)
+        upload_thread = (
+            threads().get_thread(safe_id)
+            if explicit_session_id
+            else threads().ensure_thread(safe_id)
+        )
+        if upload_thread is None:
+            raise HTTPException(status_code=404, detail="Thread not found.")
+        expected_instance_id = upload_thread.instance_id
         uploaded_name = safe_upload_name(file.filename)
         selected_encoding = normalize_text_encoding(text_encoding)
         if selected_encoding is None:
@@ -553,13 +649,26 @@ def create_app(
         with TemporaryDirectory(prefix="ai-loop-upload-") as temp_dir:
             upload_path = Path(temp_dir) / uploaded_name
             await write_upload_file(file, upload_path)
-            current_engine = runtime()
+            if not thread_instance_is_current(
+                safe_id,
+                expected_instance_id=expected_instance_id,
+            ):
+                return stale_upload_response(safe_id)
+            current_engine = runtime(safe_id)
             pre_upload_status = current_engine.status()
             try:
                 qa_status = current_engine.process_document(
                     str(upload_path),
                     text_encoding=selected_encoding,
                 )
+                if not thread_instance_is_current(
+                    safe_id,
+                    expected_instance_id=expected_instance_id,
+                ):
+                    return stale_upload_response(
+                        safe_id,
+                        upload_runtime=current_engine,
+                    )
                 return JSONResponse(
                     {
                         "message": upload_status_message(uploaded_name, qa_status),
@@ -568,6 +677,14 @@ def create_app(
                 )
             except DocumentProcessingError as exc:
                 LOGGER.warning("Document processing failed: %s", exc)
+                if not thread_instance_is_current(
+                    safe_id,
+                    expected_instance_id=expected_instance_id,
+                ):
+                    return stale_upload_response(
+                        safe_id,
+                        upload_runtime=current_engine,
+                    )
                 qa_status = exc.status
                 return JSONResponse(
                     {
@@ -578,6 +695,14 @@ def create_app(
                 )
             except RuntimeError as exc:
                 LOGGER.exception("Unexpected document processing failure: %s", exc)
+                if not thread_instance_is_current(
+                    safe_id,
+                    expected_instance_id=expected_instance_id,
+                ):
+                    return stale_upload_response(
+                        safe_id,
+                        upload_runtime=current_engine,
+                    )
                 qa_status = status_with_unexpected_upload_error(
                     pre_upload_status,
                     uploaded_name,
@@ -617,7 +742,7 @@ def create_app(
             limit=MAX_QUERY_HISTORY_MESSAGES,
         )
         conversation_history = conversation_history_from_messages(recent_messages)
-        current_runtime = runtime()
+        current_runtime = runtime(session_id)
         semantic_memory, semantic_memory_status = semantic_memory_context_for_query(
             current_runtime,
             store,
@@ -673,7 +798,7 @@ def create_app(
     @api.post("/api/chat/clear")
     def clear_chat(request: Optional[ClearChatRequest] = Body(default=None)) -> dict:
         session_id = safe_session_id(request.session_id if request else None)
-        current_engine = loaded_runtime()
+        current_engine = loaded_runtime(session_id)
         if current_engine is not None:
             if hasattr(current_engine, "clear_loop_session"):
                 current_engine.clear_loop_session(session_id)

@@ -433,6 +433,54 @@ def test_app_main_allows_explicit_non_loopback_host(monkeypatch):
     assert observed["port"] == 8799
 
 
+def test_thread_store_path_prefers_loopwright_env(monkeypatch, tmp_path):
+    new_path = tmp_path / "loopwright.sqlite3"
+    old_path = tmp_path / "legacy.sqlite3"
+    monkeypatch.setenv("LOOPWRIGHT_THREAD_DB_PATH", str(new_path))
+    monkeypatch.setenv("AI_LOOP_THREAD_DB_PATH", str(old_path))
+
+    assert web_app.default_thread_store_path() == new_path
+
+
+def test_thread_store_path_accepts_legacy_ai_loop_env(monkeypatch, tmp_path):
+    legacy_path = tmp_path / "legacy.sqlite3"
+    monkeypatch.delenv("LOOPWRIGHT_THREAD_DB_PATH", raising=False)
+    monkeypatch.setenv("AI_LOOP_THREAD_DB_PATH", str(legacy_path))
+
+    assert web_app.default_thread_store_path() == legacy_path
+
+
+def test_thread_store_path_uses_legacy_default_when_new_default_missing(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("LOOPWRIGHT_THREAD_DB_PATH", raising=False)
+    monkeypatch.delenv("AI_LOOP_THREAD_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    legacy_default = tmp_path / ".ai-loop-engine" / "threads.sqlite3"
+    legacy_default.parent.mkdir()
+    legacy_default.write_bytes(b"legacy sqlite placeholder")
+
+    assert web_app.default_thread_store_path() == legacy_default
+
+
+def test_thread_store_path_prefers_loopwright_default_when_present(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("LOOPWRIGHT_THREAD_DB_PATH", raising=False)
+    monkeypatch.delenv("AI_LOOP_THREAD_DB_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    legacy_default = tmp_path / ".ai-loop-engine" / "threads.sqlite3"
+    new_default = tmp_path / ".loopwright" / "threads.sqlite3"
+    legacy_default.parent.mkdir()
+    new_default.parent.mkdir()
+    legacy_default.write_bytes(b"legacy sqlite placeholder")
+    new_default.write_bytes(b"new sqlite placeholder")
+
+    assert web_app.default_thread_store_path() == new_default
+
+
 def test_static_frontend_is_served():
     client = TestClient(web_app.create_app(FakeQA()))
 
@@ -442,12 +490,16 @@ def test_static_frontend_is_served():
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert "AI Loop Engine" in response.text
+    assert "Loopwright" in response.text
+    assert "Model status" in response.text
+    assert "backend-pill" in response.text
+    assert "model-pill" in response.text
     assert "Threads" in response.text
     assert "Loop Recipe" in response.text
     assert "Durable Runs" in response.text
-    assert "Files" in response.text
-    assert "Smart Evidence can still use web evidence" in response.text
+    assert "Attach File" in response.text
+    assert "file-scope" in response.text
+    assert "No file attached to this session" in response.text
     assert "Model Thinking" in response.text
     assert "active-thread-memory" in response.text
     assert "memory-status" in response.text
@@ -455,10 +507,16 @@ def test_static_frontend_is_served():
     assert "Run Loop" not in response.text
     assert "query-context-control" not in response.text
     assert "/assets/app.js" in response.text
+    assert response.text.index('id="query-input"') < response.text.index(
+        'id="upload-button"'
+    )
+    assert response.text.index('id="upload-button"') < response.text.index(
+        'id="query-button"'
+    )
     assert script.status_code == 200
     assert script.headers["cache-control"] == "no-store"
-    assert "Ask anything. Add files only" in script.text
-    assert "smart evidence" in script.text
+    assert "No messages yet." in script.text
+    assert "No file attached to this session" in script.text
     assert "renderMessageThinking" in script.text
     assert "session_id" in script.text
     assert "switchThread" in script.text
@@ -498,6 +556,217 @@ def run_frontend_node(script: str) -> None:
         check=True,
     )
     assert result.stderr == ""
+
+
+def test_static_frontend_uploads_files_to_active_thread():
+    run_frontend_node(
+        r'''
+import assert from "node:assert/strict";
+const {
+  createDom,
+  createThreadPayload,
+  importFreshApp,
+  jsonResponse,
+  tick,
+} = await import(process.env.FRONTEND_HARNESS_URL);
+
+const dom = createDom();
+const statusSessionIds = [];
+const uploadSessionIds = [];
+const uploadEncodingModes = [];
+const recipes = [{
+  recipe_id: "recipe_general_loop",
+  name: "General assistant loop",
+  goal: "Answer the request clearly.",
+  context_provider: "smart",
+  model_profile: "quality",
+  verifier: "default",
+  instructions: "",
+  success_criteria: [],
+  stop_condition: "",
+  is_default: true,
+}];
+const serverThreads = [createThreadPayload("thread_alpha")];
+
+globalThis.fetch = async (url, options = {}) => {
+  const method = String(options.method || "GET").toUpperCase();
+  if (url === "/api/config") {
+    return jsonResponse({ text_encodings: [{ label: "Auto", value: "auto" }] });
+  }
+  if (url === "/api/status") {
+    statusSessionIds.push(options.headers?.["x-ai-loop-session-id"] || null);
+    return jsonResponse({
+      backend: "mock",
+      model: "MockLLM",
+      ready_for_queries: false,
+      query_mode: "direct",
+      chunk_count: 0,
+    });
+  }
+  if (url === "/api/recipes") {
+    return jsonResponse({ default_recipe_id: "recipe_general_loop", recipes });
+  }
+  if (url.startsWith("/api/recipes/") && method === "GET") {
+    return jsonResponse(recipes[0]);
+  }
+  if (url === "/api/threads" && method === "GET") {
+    return jsonResponse({ threads: serverThreads });
+  }
+  if (url.startsWith("/api/threads/") && method === "GET") {
+    return jsonResponse(serverThreads[0]);
+  }
+  if (url === "/api/documents" && method === "POST") {
+    uploadSessionIds.push(options.body.get("session_id"));
+    uploadEncodingModes.push(options.body.get("text_encoding"));
+    return jsonResponse({
+      message: "File indexed.",
+      status: {
+        backend: "mock",
+        model: "MockLLM",
+        ready_for_queries: true,
+        active_document: "alpha.txt",
+        query_mode: "retrieval",
+        chunk_count: 1,
+      },
+    });
+  }
+  throw new Error(`unexpected fetch ${url}`);
+};
+
+await importFreshApp();
+await tick();
+
+dom["document-file"].files = [
+  new Blob(["Project Phoenix"], { type: "text/plain" }),
+];
+await dom["document-file"].dispatch("change");
+
+assert.deepEqual(statusSessionIds, ["thread_alpha"]);
+assert.deepEqual(uploadSessionIds, ["thread_alpha"]);
+assert.deepEqual(uploadEncodingModes, ["auto"]);
+assert.equal(dom["backend-pill"].textContent, "mock");
+assert.equal(dom["model-pill"].textContent, "MockLLM");
+assert.equal(dom["ready-pill"].textContent, "file attached");
+assert.equal(dom["file-scope"].textContent, "alpha.txt");
+assert.equal(
+  dom["upload-status"].textContent,
+  "alpha.txt is attached to this session.",
+);
+'''
+    )
+
+
+def test_static_frontend_ignores_stale_upload_response_after_thread_switch():
+    run_frontend_node(
+        r'''
+import assert from "node:assert/strict";
+const {
+  createDom,
+  createThreadPayload,
+  deferred,
+  importFreshApp,
+  jsonResponse,
+  tick,
+} = await import(process.env.FRONTEND_HARNESS_URL);
+
+const dom = createDom();
+const uploadResponse = deferred();
+const statusSessionIds = [];
+const uploadSessionIds = [];
+const recipes = [{
+  recipe_id: "recipe_general_loop",
+  name: "General assistant loop",
+  goal: "Answer the request clearly.",
+  context_provider: "smart",
+  model_profile: "quality",
+  verifier: "default",
+  instructions: "",
+  success_criteria: [],
+  stop_condition: "",
+  is_default: true,
+}];
+const serverThreads = [
+  createThreadPayload("thread_alpha"),
+  createThreadPayload("thread_beta"),
+];
+serverThreads[0].title = "Alpha thread";
+serverThreads[1].title = "Beta thread";
+
+globalThis.fetch = async (url, options = {}) => {
+  const method = String(options.method || "GET").toUpperCase();
+  if (url === "/api/config") {
+    return jsonResponse({ text_encodings: [{ label: "Auto", value: "auto" }] });
+  }
+  if (url === "/api/status") {
+    const sessionId = options.headers?.["x-ai-loop-session-id"] || null;
+    statusSessionIds.push(sessionId);
+    return jsonResponse({
+      backend: "mock",
+      model: "MockLLM",
+      ready_for_queries: false,
+      active_document: null,
+      query_mode: "direct",
+      chunk_count: 0,
+    });
+  }
+  if (url === "/api/recipes") {
+    return jsonResponse({ default_recipe_id: "recipe_general_loop", recipes });
+  }
+  if (url.startsWith("/api/recipes/") && method === "GET") {
+    return jsonResponse(recipes[0]);
+  }
+  if (url === "/api/threads" && method === "GET") {
+    return jsonResponse({ threads: serverThreads });
+  }
+  if (url.startsWith("/api/threads/") && method === "GET") {
+    const id = decodeURIComponent(url.slice("/api/threads/".length));
+    return jsonResponse(serverThreads.find((thread) => thread.id === id));
+  }
+  if (url === "/api/documents" && method === "POST") {
+    uploadSessionIds.push(options.body.get("session_id"));
+    return uploadResponse.promise;
+  }
+  throw new Error(`unexpected fetch ${url}`);
+};
+
+await importFreshApp();
+await tick();
+
+dom["document-file"].files = [
+  new Blob(["Project Phoenix"], { type: "text/plain" }),
+];
+const uploadPromise = dom["document-file"].dispatch("change");
+await tick();
+
+const betaButton = dom["thread-list"].children.find(
+  (button) => button.dataset.active === "false",
+);
+await betaButton.click();
+await tick();
+
+uploadResponse.resolve(jsonResponse({
+  message: "Alpha indexed.",
+  status: {
+    backend: "mock",
+    model: "MockLLM",
+    ready_for_queries: true,
+    active_document: "alpha.txt",
+    query_mode: "retrieval",
+    chunk_count: 1,
+  },
+}));
+await uploadPromise;
+await tick();
+
+assert.deepEqual(uploadSessionIds, ["thread_alpha"]);
+assert.equal(statusSessionIds.at(-1), "thread_beta");
+assert.equal(dom["file-scope"].textContent, "No file attached");
+assert.equal(
+  dom["upload-status"].textContent,
+  "Active session changed; current file status refreshed.",
+);
+'''
+    )
 
 
 def test_static_frontend_renders_assistant_content_and_model_thinking():
@@ -785,7 +1054,7 @@ const recipes = [{
 globalThis.fetch = async (url, options = {}) => {
   const method = String(options.method || "GET").toUpperCase();
   if (url === "/api/config") {
-    return jsonResponse({ title: "AI Loop Engine" });
+    return jsonResponse({ title: "Loopwright" });
   }
   if (url === "/api/status") {
     return jsonResponse({
@@ -1351,7 +1620,7 @@ await tick();
 assert.equal(nodeText(dom["thread-list"]).includes("Delete me"), false);
 assert.ok(nodeText(dom["thread-list"]).includes("Keep me"));
 assert.equal(dom["active-thread-title"].textContent, "Keep me");
-assert.equal(globalThis.localStorage.getItem("ai-loop-engine.active-thread.v1"), "thread_keep");
+assert.equal(globalThis.localStorage.getItem("loopwright.active-thread.v1"), "thread_keep");
 assert.deepEqual(detailFetches, ["thread_delete", "thread_keep"]);
 assert.equal(dom["query-button"].disabled, false);
 
@@ -1362,7 +1631,7 @@ assert.equal(createdCount, 1);
 assert.equal(serverThreads.length, 1);
 assert.equal(serverThreads[0].id, "thread_created_1");
 assert.equal(dom["active-thread-title"].textContent, "New thread");
-assert.equal(globalThis.localStorage.getItem("ai-loop-engine.active-thread.v1"), "thread_created_1");
+assert.equal(globalThis.localStorage.getItem("loopwright.active-thread.v1"), "thread_created_1");
 assert.equal(dom["delete-thread"].disabled, false);
 assert.equal(nodeText(dom["thread-list"]).includes("Keep me"), false);
 '''
@@ -1921,7 +2190,7 @@ globalThis.fetch = async (url, options = {}) => {
   }
   if (url === "/api/recipes/recipe_custom/export" && method === "GET") {
     requests.exported.push(url);
-    return jsonResponse({ ...recipes.find((recipe) => recipe.recipe_id === "recipe_custom"), exported_from: "AI Loop Engine" });
+    return jsonResponse({ ...recipes.find((recipe) => recipe.recipe_id === "recipe_custom"), exported_from: "Loopwright" });
   }
   if (url === "/api/recipes/recipe_custom" && method === "DELETE") {
     requests.deleted.push(url);
@@ -1961,7 +2230,7 @@ assert.equal(exportedRecipe.recipe_id, "recipe_custom");
 assert.equal(exportedRecipe.instructions, "Be sharp.");
 assert.deepEqual(exportedRecipe.success_criteria, ["Names risk."]);
 assert.deepEqual(exportedRecipe.metadata, { source: "test" });
-assert.equal(exportedRecipe.exported_from, "AI Loop Engine");
+assert.equal(exportedRecipe.exported_from, "Loopwright");
 assert.ok(dom["recipe-status"].textContent.includes("Exported Custom reviewer"));
 await dom["recipe-delete"].dispatch("click");
 assert.equal(deleteConfirmed, true);
@@ -1991,7 +2260,7 @@ def test_config_and_status_endpoints_return_runtime_contract():
     config = client.get("/api/config").json()
     status = client.get("/api/status").json()
 
-    assert config["title"] == "AI Loop Engine"
+    assert config["title"] == "Loopwright"
     assert {"label": "Auto", "value": "auto"} in config["text_encodings"]
     assert status["active_document"] is None
     assert status["backend"] == "mock"
@@ -2019,6 +2288,211 @@ def test_upload_document_indexes_context_and_reports_status():
     assert payload["status"]["text_encoding_mode"] == "cp1251"
     assert fake_qa.text_encoding == "cp1251"
     assert fake_qa.uploaded_text == "Project Phoenix"
+
+
+def test_upload_document_is_scoped_to_thread_runtime():
+    engines = {}
+    store = ThreadStore.in_memory()
+    store.create_thread(thread_id="thread_alpha")
+    store.create_thread(thread_id="thread_beta")
+
+    def engine_factory(session_id):
+        engine = FakeQA()
+        engines[session_id] = engine
+        return engine
+
+    client = TestClient(
+        web_app.create_app(
+            engine_factory=engine_factory,
+            thread_store=store,
+        )
+    )
+
+    response = client.post(
+        "/api/documents",
+        data={"text_encoding": "auto", "session_id": "thread_alpha"},
+        files={"file": ("alpha.txt", b"Alpha private launch date", "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert engines["thread_alpha"].current_document_name == "alpha.txt"
+    assert client.get(
+        "/api/status",
+        headers={"x-ai-loop-session-id": "thread_alpha"},
+    ).json()["active_document"] == "alpha.txt"
+    assert client.get(
+        "/api/status",
+        headers={"x-ai-loop-session-id": "thread_beta"},
+    ).json()["active_document"] is None
+
+    query_response = client.post(
+        "/api/query",
+        json={"message": "What is attached?", "session_id": "thread_beta"},
+    )
+
+    assert query_response.status_code == 200
+    assert engines["thread_beta"] is not engines["thread_alpha"]
+    assert engines["thread_beta"].current_document_name is None
+    assert engines["thread_beta"].last_query_session_id == "thread_beta"
+    assert query_response.json()["summary"]["document"] is None
+
+
+def test_upload_document_rejects_missing_explicit_thread():
+    engines = {}
+
+    def engine_factory(session_id):
+        engine = FakeQA()
+        engines[session_id] = engine
+        return engine
+
+    client = TestClient(
+        web_app.create_app(
+            engine_factory=engine_factory,
+            thread_store=ThreadStore.in_memory(),
+        )
+    )
+
+    response = client.post(
+        "/api/documents",
+        data={"text_encoding": "auto", "session_id": "thread_missing"},
+        files={"file": ("alpha.txt", b"Alpha private launch date", "text/plain")},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Thread not found."
+    assert engines == {}
+
+
+def test_upload_document_generation_change_does_not_drop_runtime():
+    store = ThreadStore.in_memory()
+    store.create_thread(thread_id="thread_alpha")
+    engines = {}
+
+    class ClearDuringReplacementQA(FakeQA):
+        def process_document(self, document_path, text_encoding=None):
+            status = super().process_document(document_path, text_encoding=text_encoding)
+            if Path(document_path).name == "new.txt":
+                assert store.clear_thread("thread_alpha") is not None
+            return status
+
+    def engine_factory(session_id):
+        engine = ClearDuringReplacementQA()
+        engines[session_id] = engine
+        return engine
+
+    client = TestClient(
+        web_app.create_app(
+            engine_factory=engine_factory,
+            thread_store=store,
+        )
+    )
+
+    old_response = client.post(
+        "/api/documents",
+        data={"text_encoding": "auto", "session_id": "thread_alpha"},
+        files={"file": ("old.txt", b"Old active document", "text/plain")},
+    )
+    assert old_response.status_code == 200
+    assert engines["thread_alpha"].current_document_name == "old.txt"
+
+    replacement_response = client.post(
+        "/api/documents",
+        data={"text_encoding": "auto", "session_id": "thread_alpha"},
+        files={"file": ("new.txt", b"Replacement document", "text/plain")},
+    )
+
+    assert replacement_response.status_code == 200
+    assert replacement_response.json()["status"]["active_document"] == "new.txt"
+    assert engines["thread_alpha"].current_document_name == "new.txt"
+    status = client.get(
+        "/api/status",
+        headers={"x-ai-loop-session-id": "thread_alpha"},
+    )
+    assert status.status_code == 200
+    assert status.json()["active_document"] == "new.txt"
+
+
+def test_upload_document_rejects_deleted_thread_after_file_write(monkeypatch):
+    store = ThreadStore.in_memory()
+    store.create_thread(thread_id="thread_alpha")
+    engines = {}
+
+    def engine_factory(session_id):
+        engine = FakeQA()
+        engines[session_id] = engine
+        return engine
+
+    async def delete_thread_during_write(upload, upload_path):
+        upload_path.write_bytes(await upload.read())
+        assert store.delete_thread("thread_alpha") is True
+
+    monkeypatch.setattr(web_app, "write_upload_file", delete_thread_during_write)
+    client = TestClient(
+        web_app.create_app(
+            engine_factory=engine_factory,
+            thread_store=store,
+        )
+    )
+
+    response = client.post(
+        "/api/documents",
+        data={"text_encoding": "auto", "session_id": "thread_alpha"},
+        files={"file": ("alpha.txt", b"Alpha private launch date", "text/plain")},
+    )
+
+    assert response.status_code == 409
+    assert "Thread changed before document upload completed" in response.json()["detail"]
+    assert "thread_alpha" not in engines
+    assert client.get("/api/threads/thread_alpha").status_code == 404
+    assert client.get(
+        "/api/status",
+        headers={"x-ai-loop-session-id": "thread_alpha"},
+    ).status_code == 404
+
+
+def test_upload_document_drops_runtime_when_thread_deleted_after_indexing():
+    store = ThreadStore.in_memory()
+    store.create_thread(thread_id="thread_alpha")
+    engines = {}
+
+    class DeletingAfterIndexQA(FakeQA):
+        def process_document(self, document_path, text_encoding=None):
+            status = super().process_document(document_path, text_encoding=text_encoding)
+            assert store.delete_thread("thread_alpha") is True
+            return status
+
+    def engine_factory(session_id):
+        engine = DeletingAfterIndexQA()
+        engines[session_id] = engine
+        return engine
+
+    client = TestClient(
+        web_app.create_app(
+            engine_factory=engine_factory,
+            thread_store=store,
+        )
+    )
+
+    response = client.post(
+        "/api/documents",
+        data={"text_encoding": "auto", "session_id": "thread_alpha"},
+        files={"file": ("alpha.txt", b"Alpha private launch date", "text/plain")},
+    )
+
+    assert response.status_code == 409
+    assert "Thread changed before document upload completed" in response.json()["detail"]
+    assert engines["thread_alpha"].current_document_name == "alpha.txt"
+    assert client.get("/api/threads/thread_alpha").status_code == 404
+
+    store.create_thread(thread_id="thread_alpha")
+    status = client.get(
+        "/api/status",
+        headers={"x-ai-loop-session-id": "thread_alpha"},
+    )
+
+    assert status.status_code == 200
+    assert status.json()["active_document"] is None
+    assert engines["thread_alpha"].current_document_name is None
 
 
 def test_upload_document_rejects_unknown_encoding():
@@ -2369,7 +2843,7 @@ def test_query_endpoint_refreshes_stale_builtin_default_recipe():
     stale_default = LoopRecipe(
         recipe_id=DEFAULT_LOOP_RECIPE_ID,
         name="General assistant loop",
-        description="Default local-first loop behavior.",
+        description="Default evidence loop behavior.",
         goal="Answer using indexed context.",
         instructions="Use indexed context when present.",
         success_criteria=("Uses indexed context.",),
@@ -2464,7 +2938,7 @@ def test_recipe_endpoints_manage_loop_recipes():
     exported = client.get(f"/api/recipes/{recipe_id}/export")
     assert exported.status_code == 200
     assert exported.json()["recipe_id"] == recipe_id
-    assert exported.json()["exported_from"] == "AI Loop Engine"
+    assert exported.json()["exported_from"] == "Loopwright"
 
     duplicate = client.post(
         "/api/recipes",
