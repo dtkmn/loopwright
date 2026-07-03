@@ -233,10 +233,49 @@ section {
   font-size: 0.74rem;
 }
 
-.upload-form,
 .query-form {
   display: grid;
   gap: 12px;
+}
+
+.composer-footer {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.session-file-panel {
+  align-items: center;
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+
+.session-file-copy {
+  min-width: 0;
+}
+
+.session-file-copy span {
+  color: var(--text);
+  display: block;
+  font-size: 0.84rem;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.session-file-status {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.session-file-status {
+  margin: 2px 0 0;
 }
 
 label {
@@ -352,24 +391,6 @@ textarea {
   font-size: 0.72rem;
   line-height: 1;
   padding: 0.35rem 0.55rem;
-}
-
-.runtime-grid {
-  display: grid;
-  gap: 8px 12px;
-  grid-template-columns: minmax(105px, 0.75fr) minmax(0, 1fr);
-  margin: 0;
-}
-
-.runtime-grid dt {
-  color: var(--subtle);
-  font-size: 0.76rem;
-}
-
-.runtime-grid dd {
-  color: var(--text);
-  margin: 0;
-  overflow-wrap: anywhere;
 }
 
 .messages {
@@ -546,7 +567,7 @@ textarea {
 }
 
 .query-form {
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   margin-top: 14px;
 }
 
@@ -555,12 +576,7 @@ textarea {
 }
 
 .query-form textarea {
-  grid-column: 1;
-}
-
-.query-form button {
-  align-self: stretch;
-  grid-column: 2;
+  grid-column: 1 / -1;
 }
 
 .timeline {
@@ -810,12 +826,19 @@ textarea {
     justify-content: start;
   }
 
-  .query-form {
+  .composer-footer {
+    align-items: stretch;
+    display: grid;
     grid-template-columns: 1fr;
   }
 
-  .query-form button,
-  .query-form textarea {
-    grid-column: 1;
+  .session-file-panel {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .composer-footer button {
+    width: 100%;
   }
 }

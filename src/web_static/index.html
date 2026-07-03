@@ -13,10 +13,10 @@
           <p class="eyebrow">Local-first loop runtime</p>
           <h1>AI Loop Engine</h1>
         </div>
-        <div class="status-pills" aria-label="Runtime status">
+        <div class="status-pills" aria-label="Model status">
           <span class="pill" id="backend-pill">backend</span>
           <span class="pill" id="model-pill">model</span>
-          <span class="pill" id="ready-pill">smart evidence</span>
+          <span class="pill" id="ready-pill">no file</span>
         </div>
       </header>
 
@@ -80,26 +80,6 @@
           <p class="status-message compact" id="recipe-status">
             Loading loop recipes...
           </p>
-          <div class="panel-divider"></div>
-          <div class="panel-heading">
-            <h2 id="context-title">Files</h2>
-            <button class="ghost-button" id="refresh-status" type="button">Refresh</button>
-          </div>
-          <form id="upload-form" class="upload-form">
-            <label>
-              File
-              <input id="document-file" name="file" type="file" accept=".pdf,.docx,.txt,.md" />
-            </label>
-            <label>
-              Text encoding
-              <select id="text-encoding" name="text_encoding"></select>
-            </label>
-            <button id="upload-button" type="submit">Index File</button>
-          </form>
-          <p class="status-message" id="upload-status">
-            No file indexed. Smart Evidence can still use web evidence or direct model knowledge.
-          </p>
-          <dl class="runtime-grid" id="runtime-grid"></dl>
         </section>
 
         <section class="chat-panel" aria-labelledby="chat-title">
@@ -118,7 +98,20 @@
             <input id="query-context" name="context_provider" type="hidden" value="" />
             <label class="visually-hidden" for="query-input">Question</label>
             <textarea id="query-input" rows="3" placeholder="Ask anything"></textarea>
-            <button id="query-button" type="submit">Ask</button>
+            <div class="composer-footer">
+              <div class="session-file-panel">
+                <button class="ghost-button" id="upload-button" type="button">Attach File</button>
+                <input class="visually-hidden" id="document-file" name="file" type="file" accept=".pdf,.docx,.txt,.md" />
+                <input id="text-encoding" name="text_encoding" type="hidden" value="auto" />
+                <div class="session-file-copy">
+                  <span id="file-scope">No file attached</span>
+                  <p class="session-file-status" id="upload-status">
+                    No file attached to this session.
+                  </p>
+                </div>
+              </div>
+              <button id="query-button" type="submit">Ask</button>
+            </div>
           </form>
         </section>
 
