@@ -48,7 +48,7 @@ ai-loop-ollama-eval = "src.ollama_model_eval:main"
 dev = [
   "httpx==0.28.1",
   "pip-audit==2.10.1",
-  "pytest==9.0.2",
+  "pytest==9.0.3",
 ]
 
 [tool.setuptools.packages.find]
