@@ -4,7 +4,7 @@ aiohttp==3.14.1
 charset-normalizer==3.4.4
 docx2txt==0.9
 faiss-cpu==1.13.2
-fastapi==0.138.0
+fastapi==0.139.0
 langchain==1.3.10
 # Keep the LangChain family aligned; langchain 1.3.x requires langchain-core >=1.4.7.
 langchain-core==1.4.8
