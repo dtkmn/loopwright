@@ -76,7 +76,7 @@ Primary runtime files:
 ## Setup Commands
 
 - Install local dependencies: `uv sync --dev`
-- Pip fallback: `python -m pip install -r requirements-dev.txt`
+- Pip fallback: `python -m pip install -r requirements.txt -r requirements-dev.txt`
 - Run the app locally: `uv run loopwright` or `python -m src.app`
 - Run tests: `uv run pytest` or `python -m pytest`
 - Compile check: `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/loop_eval.py src/ollama_model_eval.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_ollama_model_eval.py tests/test_packaging_metadata.py tests/test_thread_store.py`

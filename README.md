@@ -67,7 +67,7 @@ to fake.
     ```bash
     python -m venv venv
     source venv/bin/activate  # On Windows: venv\Scripts\activate
-    python -m pip install -r requirements-dev.txt
+    python -m pip install -r requirements.txt -r requirements-dev.txt
     ```
 
 3. Run with Ollama:
