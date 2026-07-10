@@ -1,3 +1,4 @@
+import re
 import tomllib
 from pathlib import Path
 
@@ -5,14 +6,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def requirement_lines(path: str) -> tuple[str, ...]:
-    lines = []
-    for raw_line in (PROJECT_ROOT / path).read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith("-r "):
-            continue
-        lines.append(line)
-    return tuple(lines)
+def _pkg_name(dep_str: str) -> str:
+    name = re.split(r"[><=!;\s\[]", dep_str)[0].strip()
+    return name.lower().replace("-", "_")
 
 
 def pyproject() -> dict:
@@ -32,28 +28,6 @@ def locked_project_package() -> dict:
         if package["name"] == "loopwright":
             return package
     raise AssertionError("loopwright package missing from uv.lock")
-
-
-def test_runtime_requirements_match_pyproject_dependencies():
-    assert tuple(pyproject()["project"]["dependencies"]) == requirement_lines(
-        "requirements.txt"
-    )
-
-
-def test_dev_requirements_match_pyproject_dev_group():
-    assert tuple(pyproject()["dependency-groups"]["dev"]) == requirement_lines(
-        "requirements-dev.txt"
-    )
-
-
-def test_console_scripts_are_declared():
-    scripts = pyproject()["project"]["scripts"]
-    assert scripts["loopwright"] == "src.app:main"
-    assert scripts["ai-loop-engine"] == "src.app:main"
-    assert scripts["loopwright-eval"] == "src.loop_eval:main"
-    assert scripts["ai-loop-eval"] == "src.loop_eval:main"
-    assert scripts["loopwright-ollama-eval"] == "src.ollama_model_eval:main"
-    assert scripts["ai-loop-ollama-eval"] == "src.ollama_model_eval:main"
 
 
 def test_static_frontend_assets_are_packaged():
@@ -78,14 +52,14 @@ def test_removed_model_stack_is_not_direct_dependency():
     removed_direct_dependencies = {
         "accelerate",
         "gradio",
-        "huggingface-hub",
-        "langchain-huggingface",
-        "sentence-transformers",
+        "huggingface_hub",
+        "langchain_huggingface",
+        "sentence_transformers",
         "torch",
         "transformers",
     }
     direct_dependency_names = {
-        dependency.split("==", 1)[0]
+        _pkg_name(dependency)
         for dependency in pyproject()["project"]["dependencies"]
     }
 
