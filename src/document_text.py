@@ -219,7 +219,21 @@ class DefaultTextDecoder:
         # Auto mode must fail closed on ambiguous legacy candidates. The UI
         # defaults to Auto; Western and other legacy codecs are explicit opt-ins.
         if len(raw_content) <= MAX_SHORT_WESTERN_FALLBACK_BYTES:
-            return fallback_penalty == 0
+            if fallback_penalty != 0:
+                return False
+            # charset_normalizer is unreliable for very short content. Explicitly
+            # verify that no conflicting legacy encoding produces a plausible but
+            # different decode — if one does, the content is ambiguous.
+            for conflict_enc in CONFLICTING_LEGACY_ENCODINGS:
+                try:
+                    conflict_text = self.decode_supported_text(raw_content, conflict_enc)
+                except (LookupError, UnicodeDecodeError):
+                    continue
+                if conflict_text == fallback_text:
+                    continue
+                if western_text_penalty(conflict_text) is not None:
+                    return False
+            return True
 
         return fallback_listed_as_low_chaos and fallback_penalty == 0
 
