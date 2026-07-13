@@ -181,7 +181,7 @@ uuid-utils==0.17.0
     #   langsmith
 uvicorn==0.51.0
     # via loopwright
-websockets==15.0.1
+websockets==16.1
     # via
     #   langgraph-sdk
     #   langsmith
