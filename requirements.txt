@@ -136,7 +136,7 @@ pydantic==2.13.4
     #   loopwright
 pydantic-core==2.46.4
     # via pydantic
-pypdf==6.14.2
+pypdf==6.16.1
     # via loopwright
 python-multipart==0.0.32
     # via loopwright
