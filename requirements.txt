@@ -55,7 +55,7 @@ langchain-protocol==0.0.18
     # via langchain-core
 langchain-text-splitters==1.1.2
     # via loopwright
-langsmith==0.10.2
+langsmith==0.12.5
     # via langchain-core
 numpy==2.4.6 ; python_full_version < '3.12'
     # via
