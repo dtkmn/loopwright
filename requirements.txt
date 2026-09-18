@@ -78,7 +78,7 @@ pydantic==2.13.4
     #   langchain-core
     #   langsmith
     #   loopwright
-pydantic-core==2.46.4
+pydantic-core==2.49.0
     # via pydantic
 pypdf==6.19.0
     # via loopwright
