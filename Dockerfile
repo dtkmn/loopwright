@@ -1,30 +1,30 @@
 # Use a current Python runtime with security updates.
 FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:0.12.15 /uv /uvx /usr/local/bin/
 
 # Set the working directory
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    UV_PYTHON_DOWNLOADS=0 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
-RUN python -m pip install --upgrade pip
-
-# Copy the requirements file into the image
-COPY requirements.txt .
-
-# Install the dependencies as root first
-RUN python -m pip install -r requirements.txt
+# Cache third-party dependencies separately from application source.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project
 
 # Copy the rest of the application code into the image
 COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-editable
 
 # Create a non-root user and set permissions
 RUN addgroup --gid 1000 appuser && \
@@ -45,5 +45,5 @@ ENV FAST_MODE="true"
 ENV LLM_BACKEND="auto"
 ENV APP_DEBUG="false"
 
-# Command to run the FastAPI web app
-CMD ["python", "-m", "src.app"]
+# Run the installed entrypoint without resolving dependencies at startup.
+CMD ["loopwright"]

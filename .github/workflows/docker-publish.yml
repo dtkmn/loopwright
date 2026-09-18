@@ -9,7 +9,8 @@ on:
     paths:
       - Dockerfile
       - .dockerignore
-      - requirements.txt
+      - pyproject.toml
+      - uv.lock
       - src/**
       - .github/workflows/docker-publish.yml
   pull_request:
@@ -17,7 +18,8 @@ on:
     paths:
       - Dockerfile
       - .dockerignore
-      - requirements.txt
+      - pyproject.toml
+      - uv.lock
       - src/**
       - .github/workflows/docker-publish.yml
   workflow_dispatch:

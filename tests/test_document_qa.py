@@ -7958,7 +7958,14 @@ def test_text_loader_detects_utf_family_encodings(tmp_path, encoding, text):
 
 
 def test_text_loader_uses_confident_detector_for_legacy_encoding(tmp_path):
-    text = "Zażółć gęślą jaźń"
+    # A short pangram can have zero detector confidence. Use enough natural
+    # language to exercise confident detection without weakening Auto mode.
+    text = (
+        "Zażółć gęślą jaźń. To jest dokument w języku polskim. "
+        "Zawiera informacje o projekcie, jego właścicielu oraz planowanej "
+        "dacie rozpoczęcia. Proszę uważnie przeczytać wszystkie szczegóły "
+        "przed podjęciem decyzji."
+    )
     document = tmp_path / "polish.txt"
     document.write_bytes(text.encode("cp1250"))
     qa = DocumentQA(fast_mode=True, llm_backend="mock")
