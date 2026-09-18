@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -102,24 +103,41 @@ def test_uv_lock_matches_project_metadata():
 def test_locked_setup_rejects_stale_metadata_without_rewriting_lock(tmp_path):
     uv = shutil.which("uv")
     assert uv is not None, "Run the project tests through uv."
-    for name in ("pyproject.toml", "uv.lock", "README.md"):
-        shutil.copyfile(PROJECT_ROOT / name, tmp_path / name)
-    original_lock = (tmp_path / "uv.lock").read_bytes()
+    # A stale real-project lock can require registry metadata to re-resolve.
+    # Use a dependency-free fixture so this check also works with CI's empty
+    # cache and disabled network. Real lock metadata is checked separately.
+    manifest = tmp_path / "pyproject.toml"
+    manifest.write_text(
+        '[project]\nname = "loopwright-lock-check"\nversion = "0.1.0"\n'
+        'requires-python = ">=3.11,<3.13"\ndependencies = []\n'
+    )
     # Ignore developer uv overrides that could redirect the project or disable
     # locking. The subprocess must check this disposable project, not the repo.
-    env = {key: value for key, value in os.environ.items() if not key.startswith("UV_")}
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("UV_") and key != "VIRTUAL_ENV"
+    }
+    isolated_options = [
+        "--offline", "--cache-dir", str(tmp_path / "uv-cache"),
+        "--python", sys.executable,
+    ]
+    locked = subprocess.run(
+        [uv, "lock", *isolated_options], cwd=tmp_path, env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert locked.returncode == 0, locked.stderr
+    original_lock = (tmp_path / "uv.lock").read_bytes()
     command = [
         uv, "sync", "--locked", "--no-dev", "--no-install-project",
-        "--dry-run", "--offline",
+        "--dry-run", *isolated_options,
     ]
     valid = subprocess.run(
         command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30
     )
     assert valid.returncode == 0, valid.stderr
-    manifest = tmp_path / "pyproject.toml"
     manifest.write_text(
         manifest.read_text().replace(
-            f'version = "{pyproject()["project"]["version"]}"',
+            'version = "0.1.0"',
             'version = "999.0.0"',
             1,
         )
