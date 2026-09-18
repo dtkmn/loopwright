@@ -1,20 +1,34 @@
 # Loopwright
-Loopwright is a flight recorder for AI agent loops. It inspects and hardens
-context selection, retrieval, drafting, format checks, citation checks, claim
-verification, retries, refusals, middleware guardrails, evals, and replay. The
-current built-in evidence sources are Smart Evidence routing, DuckDuckGo web
-snippets, optional uploaded files, thread memory, and direct model knowledge.
-The product focus is trust: making agent behavior visible, testable, and harder
-to fake.
+Loopwright is a local-first, evidence-backed flight recorder for AI answer
+loops. Today it records and hardens context selection, retrieval, drafting,
+format checks, citation checks, claim verification, retries, refusals,
+middleware guardrails, and evals. The direction is a cross-runtime trust plane
+for inspecting and comparing evidence from external AI loops without becoming
+another orchestrator. The current context routes are Smart routing, DuckDuckGo
+web snippets, optional uploaded files, thread memory, and direct model
+knowledge. Only prompt-used web snippets and indexed-file chunks are treated as
+retrieved evidence; memory and direct model knowledge remain `not_verified`
+without such evidence. The product focus is trust: making behavior visible,
+testable, and harder—but not impossible—to fake.
 
 ## Features
 - **Loop Engineering Core:** Treats retrieval, drafting, format checks, self-checking, retry, refusal, middleware guardrails, and evals as the product surface rather than hidden plumbing
-- **Observable Runtime Reports:** Emits structured loop evidence for context selection, prompt evidence, drafts, format checks, verifier decisions, retries, refusals, and replay
+- **Observable Runtime Reports:** Emits structured loop evidence for context selection, prompt evidence, drafts, format checks, verifier decisions, retries, refusals, and local export
 - **Durable Local Runs:** Stores public loop-run summaries and reports in the
-  local thread database so completed runs remain inspectable after restart
+  local thread database across process restarts, and lets the browser reopen a
+  historical run's versioned public artifact projection. Historical reads
+  ignore cached public JSON and re-project the canonical raw report; malformed
+  or identity-inconsistent raw records are quarantined instead of displayed
+  Compatibility boundary: pre-binding `loop-report/v1` rows with a visible
+  terminal answer but no terminal answer/evidence-set digests, plus supported
+  rows without exact draft/verifier answer-and-evidence provenance, are retained
+  as raw SQLite data and intentionally quarantined from canonical/public
+  serving. Loopwright cannot safely infer the emitted answer or which evidence
+  a verifier saw, so this upgrade is destructive for public inspection rather
+  than a false migration.
 - **Visible Thread Memory:** Shows per-thread memory counts and last-run use of
   recent conversation or semantic memory without exposing raw recalled text
-- **Loop Recipes / Skills:** Provides saved loop recipes for goal, instructions,
+- **Loop Recipes:** Provides saved loop recipes for goal, instructions,
   success criteria, stop condition, context provider, model profile, and verifier
   metadata
 - **Smart Evidence Routing:** Uses web evidence for lookup/current questions,
@@ -35,6 +49,9 @@ to fake.
 
 
 ![Loopwright flow](docs/loopwright-flow.svg)
+
+The gated product direction is documented in
+[`docs/loopwright-trust-plane-plan.md`](docs/loopwright-trust-plane-plan.md).
 
 ## Installation
 
@@ -220,9 +237,11 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
 8. Inspect the Loop Timeline to see recipe selection, context selection, retrieve, draft, format,
    check, verify, retry, refusal, and final-decision steps in order
 9. Inspect Durable Runs to see persisted run evidence for the active thread
-10. Inspect the loop summary for memory usage, provider, recipe, draft count,
-   checks, verifier, retry/refusal state, final decision, and last error
-11. Open the answer trace when you need the detailed redacted `LoopReport`
+10. Inspect the loop summary for memory usage, provider, draft count, checks,
+   verifier outcome and typed model provenance, retry/refusal state, final
+   decision, and whether an error occurred
+11. Select a Durable Run to reopen its public evidence, or open the current
+    answer trace for the detailed `loop-public-report/v1` projection
 
 ## Technical Details
 
@@ -246,31 +265,63 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
   name for local indexed-file retrieval; per-query web search uses the same
   retrieve/draft/check/verify loop
   without becoming durable uploaded context.
-- **Typed loop primitives:** `src/loop_engine.py` defines provider-neutral `LoopRecipe`, `LoopRun`, `LoopStep`, `LoopDecision`, `LoopReport`, `LoopSession`, `LoopPolicy`, `GuardrailDecision`, `LoopMiddleware`, `VerificationResult`, and `HumanReviewRequest`
+- **Typed loop primitives:** `src/loop_engine.py` defines provider-neutral `LoopRecipe`, `LoopRun`, `LoopStep`, `LoopDecision`, `LoopReport`, `LoopSession`, `LoopPolicy`, `EvidenceReference`, `GuardrailDecision`, `LoopMiddleware`, `VerificationResult`, and `HumanReviewRequest`
 - **Runtime reports:** `AILoopEngine.query_with_trace()` returns a `QueryResult` with both the legacy answer trace and a first-class `LoopReport`
 - **Thread state:** browser threads are backed by a local SQLite store for
   thread metadata, messages, durable public loop-run records, and the latest
   public loop payload. Recent same-thread messages are passed into the runtime
   as bounded conversation context. Older same-thread messages may also be
   retrieved by local embedding similarity as semantic thread memory; browser
-  storage is only used to remember the selected thread and recipe. Public UI
-  surfaces show memory counts and last-run use, not raw recalled memory text.
+  storage is only used to remember the selected thread and recipe. Thread
+  messages remain raw local data, and the thread APIs do not provide
+  authentication or access control. Public UI surfaces show memory counts and
+  last-run use, not raw recalled memory text, but the public artifact projection
+  does not make the surrounding thread store confidential.
 - **Loop recipes:** saved local recipes provide reusable goal, instruction,
   success-criteria, stop-condition, context-provider, profile, and verifier
   metadata. They guide the run and are recorded in loop metadata, but they do
   not grant tool permissions or scheduling by themselves.
 - **Runtime session state:** completed loop reports are also retained in bounded
-  in-memory `LoopSession` objects keyed by `session_id` for local replay/export
+  in-memory `LoopSession` objects keyed by `session_id` for local artifact export
   during the running process.
-- **Replay artifacts:** local JSONL export writes one raw `LoopReport` per line,
-  suitable for future replay and diff tooling
+- **Session artifacts:** local JSONL export writes one raw `LoopReport` per line,
+  suitable as future inspect/diff input
 - **Public trace surface:** the FastAPI/static web app shows a readable Loop
-  Timeline, compact loop summary, and redacted public loop report; raw reports
-  remain internal diagnostics
+  Timeline, compact loop summary, and the versioned
+  `loop-public-report/v1` artifact. One allowlist-only projector is used by the
+  runtime report API, durable history, adapters, and export CLI. It keeps typed
+  operational provenance but omits prompts, arbitrary step names and
+  summaries, raw errors and metadata, verifier reasons and raw payloads, recipe
+  text, and human-review bodies. A valid non-guardrail completion may expose its
+  final answer. Refuse, block, review, or another guardrail-like terminal signal
+  suppresses the answer, model identity, and evidence; contradictory terminal
+  contracts fail closed instead of being projected.
+- **Answer and evidence binding:** every publicly visible non-guardrail terminal
+  answer requires a terminal final step carrying exact answer and evidence-set
+  correlation digests. A public `supported` result additionally requires an
+  ordered real-backend draft candidate and supported verifier result carrying
+  those same exact digests. Inline citation numbers must resolve to projected
+  evidence. These are internal consistency checks, not cryptographic signatures
+  or authenticity guarantees.
+- **Public evidence:** projected evidence contains a stable SHA-256-derived
+  identity, provider, citation number, and page/chunk locator only. It never
+  contains a filename, title, URL, or excerpt. The digest identifies the exact
+  reference/content inputs used to construct it; it does not establish semantic
+  equivalence, authenticity, or secrecy.
+- **Projection boundary:** the public artifact is a data-minimization surface,
+  not authentication, access control, or a general PII/secret scrub. A
+  non-guardrail terminal answer and typed provenance can still be sensitive, so
+  every exported artifact must be handled accordingly.
 - **Middleware boundary:** loop middleware can observe runs/steps, block unsafe progress, request retry/refusal, or mark a human-review pending state without introducing autonomous tool use
-- **Framework posture:** OpenAI Agents SDK and LangGraph are dependency-free
-  export targets today; Microsoft Agent Framework remains a future export
-  target. The adapter strategy lives in
+  Once a run has refused, blocked, or requested human review, its terminal
+  decision is fixed. `after_step` can observe a recorded terminal step but cannot
+  replace it. Final-step hooks are skipped for that outcome; `after_run` can
+  observe it, but cannot change it. Earlier checks and nonterminal completions
+  still permit middleware enforcement.
+- **Framework posture:** OpenAI trace-shaped JSON and LangGraph manifest JSON
+  are export targets today; their adapter modules do not import or execute the
+  framework SDKs. Microsoft Agent Framework remains a future export target. The
+  adapter strategy lives in
   [`docs/framework-adapter-strategy.md`](docs/framework-adapter-strategy.md).
 
 ### Model
@@ -294,13 +345,16 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
 - **Mock embeddings:** `LLM_BACKEND=mock` uses deterministic local hashing
   embeddings (`local-hashing-384`) for demos/tests only.
 - **Vector Store:** FAISS for efficient similarity search
-- **Framework:** LangChain for orchestration
+- **Retrieval primitives:** lightweight LangChain Core interfaces plus
+  `langchain-text-splitters`; Loopwright owns loop orchestration.
 
 ### Configuration
 - **Response Length:** 1024 new tokens (quality) / 384 new tokens (fast) by
   default. Override with `MAX_OUTPUT_TOKENS` when you want longer or shorter
   local answers.
-- **Generation mode:** Deterministic (`do_sample=False`) for more reliable context-grounded answers
+- **Generation mode:** temperature `0` / greedy-style settings reduce variance
+  for context-grounded answers, but do not guarantee bit-for-bit replay across
+  models, servers, hardware, or versions.
 - **Chunk Size:** 1200/200 overlap (quality) / 900/120 overlap (fast)
 - **Retrieval:** MMR retrieval with source/page grounding
   - **Quality:** `k=6`, `fetch_k=24`
@@ -318,10 +372,12 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
   native thread-pool surprises on local Macs.
 
 ## Runtime Direction
-- The product direction is **private by default and portable across local or
-  gateway runtimes**. Ollama is the recommended path for Mac and workstation use
-  because it keeps model setup outside the Python dependency graph and avoids
-  requiring cloud credentials.
+- Model inference and persistence can remain local by default and are portable
+  across local or gateway runtimes. Smart Evidence may send lookup/current
+  queries to DuckDuckGo; select a local-only context mode when that network
+  disclosure is unacceptable. Ollama is the recommended path for Mac and
+  workstation use because it keeps model setup outside the Python dependency
+  graph and avoids requiring cloud credentials.
 - Cloud/deployed inference should go through the generic OpenAI-compatible
   backend, not a provider-specific happy path.
 - First-party model providers are intentionally limited to Ollama and generic
@@ -336,11 +392,13 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
 ## Loop Engineering Pattern
 This repo is intentionally built around three loops:
 
-- **Runtime agent loop:** select context -> retrieve prompt evidence -> draft an
-  answer with inline citations -> run format checks -> run mechanical checks -> verify cited claims
-  with the active real backend -> retry once or fail closed -> return trace/status.
+- **Runtime answer loop:** evidence-backed route: retrieve -> cite -> draft ->
+  format/mechanical checks -> cited-support decision -> bounded retry or
+  terminal decision. Direct route: draft -> format check -> `not_verified`.
 - **Guardrail loop:** middleware hooks can run before/after runs and steps, and
-  can return typed decisions: continue, retry, refuse, block, or requires_review.
+  can return typed decisions: continue, retry, refuse, block, or
+  requires_review. A middleware retry request currently fails closed because a
+  safe execution retry path is not implemented.
 - **Engineering loop:** change one contract -> add focused regressions -> run
   golden loop evals -> run broad validation -> ask for review -> stage only
   intentional files.
@@ -357,7 +415,7 @@ uv run pytest
 ```
 
 Use these before adding planner loops, tools, multi-context memory, or more
-agent-like behavior. Blunt rule: if the boring single-agent loop is not
+agent-like behavior. Blunt rule: if the bounded answer loop is not
 measurably honest, bigger agent features will only make the failure harder to see.
 
 ### Framework Adapter Strategy
@@ -390,10 +448,17 @@ langgraph_payload = export_langgraph_session(qa_system.loop_session("default"))
 
 These helpers do not import the OpenAI Agents SDK, call OpenAI APIs, or mutate
 the original loop reports. They also do not import or execute LangGraph.
-Public/redacted export is the default; use `public=False` only for local
-diagnostics you are willing to treat as sensitive.
+Public export is the default and consumes the same versioned,
+allowlist-only `loop-public-report/v1` projection used by the web and durable
+run surfaces. It does not copy raw report fields and then try to redact known
+secrets. Terminal guardrail-like outcomes suppress the answer, model identity,
+and evidence. This projection is data minimization, not access control or a
+general secret/PII scrub, so treat every exported artifact as potentially
+sensitive.
+Use `public=False` only for local diagnostics you are willing to treat as even
+more sensitive.
 
-Use the local export CLI when starting from a JSONL replay artifact:
+Use the local export CLI when starting from a JSONL session artifact:
 
 ```bash
 uv run python -m src.loop_export \
@@ -407,30 +472,39 @@ uv run python -m src.loop_export \
   --output artifacts/langgraph-manifest.json
 ```
 
-The CLI defaults to public/redacted output. `--raw` is intentionally explicit
-because raw loop reports can contain prompts, retrieved excerpts, drafts,
-verifier payloads, and final answers.
+The CLI defaults to the same versioned public artifact projection. `--raw` is
+intentionally explicit because raw loop reports can contain prompts, retrieved
+excerpts, drafts, verifier payloads, and final answers. Public artifacts can
+still contain a valid non-guardrail terminal answer and typed provenance; they are
+not automatically safe to publish.
 
-### Local Replay Artifacts
+The CLI's `--raw` mode also accepts the original `loop-report/v1` JSONL shape
+that predates evidence identities, terminal reasons, and verifier provenance.
+Those missing fields remain empty or unknown. This compatibility path does not
+invent evidence bindings or make legacy records eligible for public export.
+
+### Local Session Artifacts
 
 `AILoopEngine` keeps recent loop reports in memory per `session_id`. Export a
-session locally when you need a replay/debug artifact:
+session locally when you need a raw diagnostic artifact or future inspect/diff
+input:
 
 ```python
 qa_system.export_loop_session_jsonl("artifacts/loop-session-default.jsonl")
 ```
 
 Each JSONL line is a raw `loop-report/v1` object. Treat these files as local
-developer diagnostics because they may include prompts, retrieved excerpts, draft
-outputs, and final answers. Planned replay/diff commands should look like:
+developer diagnostics because they may include prompts, retrieved excerpts,
+draft outputs, and final answers. Planned inspect/diff commands should look like:
 
 ```bash
 uv run python -m src.loop_replay inspect artifacts/loop-session-default.jsonl
 uv run python -m src.loop_replay diff before.jsonl after.jsonl
 ```
 
-Those commands are intentionally not implemented yet. The report shape needs to
-stay stable before replay becomes a real product surface.
+Those commands are intentionally not implemented yet. The report and public
+projection shapes need to stay stable before inspect/diff becomes a real
+product surface. Deterministic model re-execution is not implemented.
 
 ### Optional Live Ollama Model Eval
 
@@ -497,15 +571,19 @@ ollama stop qwen3:8b
 ## Security and Dependency Maintenance
 - Dependencies are declared in `pyproject.toml` and locked in `uv.lock` for the
   recommended local workflow.
-- `requirements.txt` and `requirements-dev.txt` remain pip-compatible exports
-  for Docker and conservative CI/deployment paths. Tests assert they stay
-  synchronized with `pyproject.toml`.
+- `requirements.txt` and `requirements-dev.txt` remain locked, third-party-only
+  pip-compatible exports for Docker and conservative CI/deployment paths. Tests
+  guard their generation mode and direct-dependency coverage alongside the
+  `pyproject.toml`/`uv.lock` consistency check.
 - Dependabot is enabled weekly (`.github/dependabot.yml`) for dependency updates.
-- Current direct runtime baseline includes FastAPI `0.138.0`, Uvicorn `0.38.0`,
-  LangChain `1.3.10`, FAISS CPU `1.13.2`, local text/document parsers, and the
-  dependency-free Ollama/OpenAI-compatible HTTP adapters.
-- Note: `marshmallow` is intentionally pinned to `3.26.2` because `dataclasses-json` currently requires `<4.0.0`.
-- Security-sensitive transitive dependencies are explicitly pinned (for example `aiohttp`, `urllib3`, `python-multipart`, and `orjson`) to keep audit results stable.
+- The current lock resolves FastAPI `0.139.0`, Uvicorn `0.51.0`, FAISS CPU
+  `1.14.3`, LangChain Core `1.4.9`, `langchain-text-splitters` `1.1.2`, local
+  text/document parsers, and the stdlib-HTTP Ollama/OpenAI-compatible model
+  adapters. Treat `uv.lock` as the exact baseline; lower bounds remain in
+  `pyproject.toml`.
+- Direct and transitive dependency versions are resolved and locked (including
+  `python-multipart`, `urllib3`, and `orjson`) so audits are reproducible without
+  misrepresenting lower bounds as exact pins.
 - Recommended recurring checks:
 
   ```bash
@@ -516,7 +594,9 @@ ollama stop qwen3:8b
   uv run pytest tests/test_loop_eval.py -q
   uv run pytest tests/test_ollama_model_eval.py -q
   uv run pytest
-  uv run python -m pip_audit -r requirements.txt --strict
+  uv export --locked --no-dev --no-emit-project --no-hashes \
+    -o /tmp/loopwright-audit-requirements.txt
+  uv run pip-audit -r /tmp/loopwright-audit-requirements.txt --strict
   uv run python -m pip check
   ```
 

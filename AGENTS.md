@@ -5,7 +5,8 @@
 This repository is Loopwright, a flight recorder for inspecting and hardening
 AI loops: context selection, retrieval, answer
 drafting, mechanical checks, verifier decisions, retries, refusals, evals, and
-eventual replay. The current built-in evidence providers are Smart Evidence
+future inspect/diff. Deterministic re-execution is not implemented. The current
+built-in evidence providers are Smart Evidence
 routing, DuckDuckGo web snippets, optional uploaded-file context, thread memory,
 and direct model knowledge.
 
@@ -51,6 +52,8 @@ Primary runtime files:
   monkeypatch targets. Do not add new implementation code here.
 - `src/loop_engine.py`: provider-neutral loop primitives for typed recipe, run,
   step, policy, verifier, human-review, session, and report records.
+- `src/public_projection.py`: versioned allowlist projection from raw loop
+  reports to the public artifact surface.
 - `src/loop_eval.py`: unified provider-free and optional live Ollama loop eval
   CLI with JSON artifacts containing scored `LoopReport` evidence.
 - `src/adapters/`: dependency-free framework-shaped exports from loop reports.
@@ -62,8 +65,8 @@ Primary runtime files:
 - `src/app.py`: FastAPI backend, static frontend serving, upload/query routes,
   and user-facing status messages.
 - `src/thread_store.py`: local SQLite thread metadata, message, durable
-  loop-run, recipe, semantic-memory, and latest public loop payload
-  persistence. Browser storage must remain only a selected-thread/recipe hint.
+  loop-run, recipe, and semantic-memory persistence. Browser storage must
+  remain only a selected-thread/recipe hint.
 - `src/web_contract.py`: shared API/frontend response shaping for runtime
   status, upload messages, loop timeline, loop summary, and redacted trace
   payloads.
@@ -79,8 +82,11 @@ Primary runtime files:
 - Pip fallback: `python -m pip install -r requirements.txt -r requirements-dev.txt`
 - Run the app locally: `uv run loopwright` or `python -m src.app`
 - Run tests: `uv run pytest` or `python -m pytest`
-- Compile check: `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/loop_eval.py src/ollama_model_eval.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_ollama_model_eval.py tests/test_packaging_metadata.py tests/test_thread_store.py`
-- Dependency checks: `python -m pip check` and `python -m pip_audit -r requirements.txt --strict`
+- Compile check: `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/public_projection.py src/loop_eval.py src/ollama_model_eval.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_ollama_model_eval.py tests/test_packaging_metadata.py tests/test_thread_store.py`
+- Dependency checks: `python -m pip check`; then export the locked third-party
+  set with `uv export --no-hashes --no-dev --no-emit-project --locked -o
+  /tmp/loopwright-third-party-requirements.txt` and run `python -m pip_audit -r
+  /tmp/loopwright-third-party-requirements.txt --strict`
 
 ## Non-Negotiable Contracts
 
@@ -172,10 +178,11 @@ Primary runtime files:
   hashing for deterministic demos/tests.
 - `LLM_BACKEND=auto` must select Ollama only. It must not silently select mock,
   provider-specific hosted backends, or in-process model loading.
-- Product direction is private by default and portable across local or gateway
-  runtimes. First-party model providers are Ollama and generic
-  OpenAI-compatible gateways; do not reintroduce provider-token happy paths
-  without an explicit product decision.
+- Product direction is local-first and portable across local or gateway
+  runtimes. Do not describe local storage or the public artifact projection as
+  authentication, access control, or a confidentiality guarantee. First-party
+  model providers are Ollama and generic OpenAI-compatible gateways; do not
+  reintroduce provider-token happy paths without an explicit product decision.
 - Product identity is Loopwright. Uploaded-file answering and web evidence
   are context provider capabilities, not the repo's strategic identity.
 - Typed loop records are the contract surface for future agent work. Add or
@@ -187,13 +194,14 @@ Primary runtime files:
   actual query path: prompt evidence, draft, mechanical check, verifier outcome,
   retry/refusal state, and final answer.
 - Completed query loop reports must be retained in bounded in-memory
-  `LoopSession` state keyed by `session_id`. Local replay JSONL export writes
-  raw loop reports for developer diagnostics; public UI traces must keep using
-  the redacted report surface.
+  `LoopSession` state keyed by `session_id`. Local session JSONL export writes
+  raw loop reports for developer diagnostics and future inspect/diff input; it
+  is not a replay or re-execution engine. Public UI traces must use the public
+  artifact projection.
 - Web/API threads must pass an explicit validated `session_id` into
   `AILoopEngine.query_with_trace()`. FastAPI owns local SQLite persistence for
-  thread metadata, messages, durable public loop-run records, recipes, and
-  latest public loop payloads. Recent same-thread messages should be passed as
+  thread metadata, messages, durable public loop-run records, and recipes.
+  Recent same-thread messages should be passed as
   bounded conversation context so follow-up questions can resolve references
   without leaking across threads. Older same-thread messages may be retrieved
   by embedding similarity as semantic thread memory, but public loop traces
@@ -209,13 +217,16 @@ Primary runtime files:
   or request human review, but it must not introduce autonomous tools by itself.
 - Framework adapters must export `LoopReport`/`LoopSession` surfaces before they
   execute framework runtimes. Follow `docs/framework-adapter-strategy.md`, keep
-  default exports redacted/public, and do not add OpenAI Agents SDK, LangGraph,
-  or Microsoft Agent Framework as core dependencies.
-- Adapter public export is a safety boundary. Raw loop reports require explicit
-  opt-in, and public adapter exports must fail closed/redact terminal
-  guardrail-like decisions instead of leaking blocked draft content.
-- `src.loop_export` must default to public/redacted output. Raw export is a
-  local diagnostics path and must require an explicit `--raw` flag.
+  default exports on the versioned public artifact projection, and do not add
+  OpenAI Agents SDK, LangGraph, or Microsoft Agent Framework as core
+  dependencies.
+- Adapter public projection is a data-minimization boundary, not access control
+  or a general secret/PII scrub. Raw loop reports require explicit opt-in, and
+  public adapter exports must fail closed for terminal guardrail-like decisions
+  instead of leaking blocked draft content.
+- `src.loop_export` must default to the public artifact projection. Raw export
+  is a local diagnostics path and must require an explicit `--raw` flag. Treat
+  every exported artifact as potentially sensitive.
 - `pyproject.toml` is the project metadata and local-development dependency
   contract. Keep `requirements.txt` and `requirements-dev.txt` as pip-compatible
   exports for deployment compatibility, and keep them synchronized with
@@ -279,10 +290,11 @@ For Python behavior changes:
 - `uv run pytest tests/test_langgraph_manifest_adapter.py -q`
 - `uv run pytest tests/test_loop_export.py -q`
 - `uv lock --check`
-- `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/loop_eval.py src/loop_export.py src/ollama_model_eval.py src/adapters/__init__.py src/adapters/base.py src/adapters/redaction.py src/adapters/openai_trace.py src/adapters/langgraph_manifest.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_loop_export.py tests/test_ollama_model_eval.py tests/test_openai_trace_adapter.py tests/test_langgraph_manifest_adapter.py tests/test_packaging_metadata.py tests/test_thread_store.py`
+- `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/public_projection.py src/loop_eval.py src/loop_export.py src/ollama_model_eval.py src/adapters/__init__.py src/adapters/base.py src/adapters/redaction.py src/adapters/openai_trace.py src/adapters/langgraph_manifest.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_loop_export.py tests/test_ollama_model_eval.py tests/test_openai_trace_adapter.py tests/test_langgraph_manifest_adapter.py tests/test_packaging_metadata.py tests/test_thread_store.py`
 - `python -m pip check`
 
 For dependency or security-sensitive changes:
 
 - `python -m pip install --dry-run -r requirements.txt`
-- `python -m pip_audit -r requirements.txt --strict`
+- `uv export --no-hashes --no-dev --no-emit-project --locked -o /tmp/loopwright-third-party-requirements.txt`
+- `uv run python -m pip_audit -r /tmp/loopwright-third-party-requirements.txt --strict`
