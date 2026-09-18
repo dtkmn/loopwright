@@ -262,7 +262,10 @@ class MockLLM(LLM):
 
 
 class OllamaLLM(LLM):
-    """Minimal Ollama adapter for deterministic local model inference."""
+    """Minimal Ollama adapter for local model inference.
+
+    Provider and model execution do not guarantee repeatable output or replay.
+    """
 
     model: str
     base_url: str = DEFAULT_OLLAMA_BASE_URL

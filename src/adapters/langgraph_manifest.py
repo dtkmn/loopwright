@@ -1,17 +1,29 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
+from src.adapters.base import (
+    require_run_id,
+    require_report_identities,
+    require_source_jsonl_line,
+    require_supported_report_schema,
+    require_supported_session_schema,
+    require_unique_run_ids,
+    require_unique_step_ids,
+    resolve_session_id,
+    source_jsonl_lines_for_session,
+)
 from src.adapters.redaction import (
     report_payload,
     require_public_bool,
     run_with_session_fallback,
 )
 from src.loop_engine import LoopReport, LoopSession
+from src.public_projection import PUBLIC_REPORT_PROJECTION_SCHEMA_VERSION
 
 
 ADAPTER_NAME = "langgraph_manifest"
-ADAPTER_SCHEMA_VERSION = "langgraph-manifest-export/v1"
+ADAPTER_SCHEMA_VERSION = "langgraph-manifest-export/v2"
 CHECKPOINT_NAMESPACE = "loopwright"
 
 
@@ -27,8 +39,17 @@ class LangGraphManifestAdapter:
         session_id: Optional[str] = None,
         source_jsonl_line: Optional[int] = None,
     ) -> Dict[str, Any]:
+        require_supported_report_schema(report)
+        require_report_identities(report)
+        source_jsonl_line = require_source_jsonl_line(source_jsonl_line)
         payload = report_payload(report, public=public)
-        run = run_with_session_fallback(payload["run"], session_id)
+        resolved_session_id = resolve_session_id(
+            payload["run"].get("session_id"),
+            session_id,
+        )
+        run = run_with_session_fallback(payload["run"], resolved_session_id)
+        require_run_id(run["run_id"])
+        require_unique_step_ids(run)
         manifest = _manifest_from_run(
             run,
             public=public,
@@ -38,30 +59,55 @@ class LangGraphManifestAdapter:
             "adapter_name": self.adapter_name,
             "adapter_schema_version": self.adapter_schema_version,
             "source_schema_version": payload["schema_version"],
+            "source_projection_schema_version": payload.get(
+                "projection_schema_version"
+            ),
             "public": public,
             "manifest": manifest,
             "source_report": payload,
         }
 
     def export_session(
-        self, session: LoopSession, *, public: bool = True
+        self,
+        session: LoopSession,
+        *,
+        public: bool = True,
+        source_jsonl_lines: Optional[Sequence[Optional[int]]] = None,
     ) -> Dict[str, Any]:
         require_public_bool(public)
+        require_supported_session_schema(session)
+        require_unique_run_ids(session)
+        source_lines = source_jsonl_lines_for_session(
+            session.report_count,
+            source_jsonl_lines,
+        )
         manifests = []
-        for index, report in enumerate(session.reports, start=1):
+        for report, source_line in zip(session.reports, source_lines):
+            require_report_identities(report)
             payload = report_payload(report, public=public)
-            run = run_with_session_fallback(payload["run"], session.session_id)
+            resolved_session_id = resolve_session_id(
+                payload["run"].get("session_id"),
+                session.session_id,
+            )
+            run = run_with_session_fallback(
+                payload["run"],
+                resolved_session_id,
+            )
+            require_unique_step_ids(run)
             manifests.append(
                 _manifest_from_run(
                     run,
                     public=public,
-                    source_jsonl_line=index,
+                    source_jsonl_line=source_line,
                 )
             )
         return {
             "adapter_name": self.adapter_name,
             "adapter_schema_version": self.adapter_schema_version,
             "source_schema_version": session.schema_version,
+            "source_projection_schema_version": (
+                PUBLIC_REPORT_PROJECTION_SCHEMA_VERSION if public else None
+            ),
             "public": public,
             "session_id": session.session_id,
             "thread_id": session.session_id,
@@ -85,8 +131,17 @@ def export_report(
     )
 
 
-def export_session(session: LoopSession, *, public: bool = True) -> Dict[str, Any]:
-    return LangGraphManifestAdapter().export_session(session, public=public)
+def export_session(
+    session: LoopSession,
+    *,
+    public: bool = True,
+    source_jsonl_lines: Optional[Sequence[Optional[int]]] = None,
+) -> Dict[str, Any]:
+    return LangGraphManifestAdapter().export_session(
+        session,
+        public=public,
+        source_jsonl_lines=source_jsonl_lines,
+    )
 
 
 def _manifest_from_run(
@@ -95,7 +150,7 @@ def _manifest_from_run(
     public: bool,
     source_jsonl_line: Optional[int],
 ) -> Dict[str, Any]:
-    thread_id = run.get("session_id") or "default"
+    thread_id = run.get("session_id")
     checkpoints = [
         _checkpoint_from_step(
             step,
@@ -116,6 +171,9 @@ def _manifest_from_run(
         "started_at": run.get("started_at"),
         "completed_at": run.get("completed_at"),
         "final_decision": run.get("final_decision"),
+        "terminal_reason": run.get("terminal_reason"),
+        "error_present": bool(run.get("error_present") or run.get("error_message")),
+        "evidence": list(run.get("evidence") or ()),
         "phase_order": [checkpoint["phase"] for checkpoint in checkpoints],
         "nodes": [
             {
@@ -130,7 +188,11 @@ def _manifest_from_run(
             "user_input": run.get("user_input"),
             "final_answer": run.get("final_answer"),
             "error_message": run.get("error_message"),
+            "error_present": bool(
+                run.get("error_present") or run.get("error_message")
+            ),
             "final_decision": run.get("final_decision"),
+            "terminal_reason": run.get("terminal_reason"),
         },
         "metadata": {
             "public": public,
@@ -144,7 +206,7 @@ def _checkpoint_from_step(
     step: Mapping[str, Any],
     *,
     run: Mapping[str, Any],
-    thread_id: str,
+    thread_id: Optional[str],
     step_index: int,
     source_jsonl_line: Optional[int],
 ) -> Dict[str, Any]:
@@ -167,9 +229,15 @@ def _checkpoint_from_step(
             "input_summary": step.get("input_summary"),
             "output_summary": step.get("output_summary"),
             "error_message": step.get("error_message"),
+            "error_present": bool(
+                step.get("error_present") or step.get("error_message")
+            ),
             "retry_count": step.get("retry_count", 0),
             "verification": step.get("verification"),
             "human_review": step.get("human_review"),
+            "human_review_required": bool(
+                step.get("human_review_required") or step.get("human_review")
+            ),
         },
         "metadata": step.get("metadata") or {},
     }

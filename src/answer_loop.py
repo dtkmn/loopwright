@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -110,11 +111,16 @@ def answer_is_refusal(answer: str) -> bool:
     return any(marker in lowered for marker in refusal_markers)
 
 
+INLINE_CITATION_MARKER_PATTERN = re.compile(
+    r"(?<!\S)\[(\d+)\](?=$|[\s.,;:!?)])"
+)
+
+
 def inline_citation_ids(answer: str) -> List[int]:
     citation_ids = []
-    for match in re.findall(r"\[(\d+)\]", answer):
+    for match in INLINE_CITATION_MARKER_PATTERN.finditer(answer):
         try:
-            citation_ids.append(int(match))
+            citation_ids.append(int(match.group(1)))
         except ValueError:
             continue
     return citation_ids
@@ -644,7 +650,7 @@ def loop_decision_for_self_check(self_check: AnswerSelfCheck) -> LoopDecision:
 
 
 def verification_result_for_self_check(
-    self_check: AnswerSelfCheck, *, verifier: str
+    self_check: AnswerSelfCheck, *, verifier: Optional[str]
 ) -> VerificationResult:
     reasons = tuple(self_check.reasons)
     if self_check.outcome == "supported":
@@ -692,19 +698,48 @@ def verifier_prompt(
     )
 
 
+def _reject_duplicate_verifier_json_keys(pairs):
+    payload = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate verifier JSON key: {key!r}")
+        payload[key] = value
+    return payload
+
+
+def _reject_nonfinite_verifier_json_constant(value: str):
+    raise ValueError(f"non-finite verifier JSON number: {value}")
+
+
+def _parse_finite_verifier_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("verifier JSON number is outside the finite range")
+    return parsed
+
+
 def parse_verifier_response(raw_response: str) -> Tuple[Optional[str], str]:
-    json_match = re.search(r"\{.*\}", raw_response, flags=re.DOTALL)
-    if not json_match:
+    raw_payload = raw_response.strip()
+    if "{" not in raw_payload:
         return None, "missing_json"
     try:
-        payload = json.loads(json_match.group(0))
-    except json.JSONDecodeError:
+        payload = json.loads(
+            raw_payload,
+            object_pairs_hook=_reject_duplicate_verifier_json_keys,
+            parse_constant=_reject_nonfinite_verifier_json_constant,
+            parse_float=_parse_finite_verifier_json_float,
+        )
+    except (json.JSONDecodeError, ValueError):
+        return None, "invalid_json"
+    if type(payload) is not dict:
         return None, "invalid_json"
 
-    outcome = str(payload.get("outcome", "")).strip().lower()
-    if outcome not in VERIFIER_OUTCOMES:
+    outcome = payload.get("outcome")
+    if type(outcome) is not str or outcome not in VERIFIER_OUTCOMES:
         return None, "invalid_outcome"
-    reason = str(payload.get("reason", "")).strip()
+    reason = payload.get("reason")
+    if type(reason) is not str or not reason.strip():
+        return None, "invalid_reason"
     return outcome, reason
 
 

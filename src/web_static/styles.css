@@ -665,9 +665,43 @@ textarea {
   background: rgb(255 255 255 / 2%);
   border: 1px solid var(--line);
   border-radius: 8px;
+  color: var(--text);
   display: grid;
   gap: 5px;
+  min-height: auto;
   padding: 10px;
+  text-align: left;
+  width: 100%;
+}
+
+.run-row:hover,
+.run-row:focus-visible {
+  background: rgb(117 167 255 / 8%);
+  border-color: rgb(117 167 255 / 48%);
+}
+
+.run-row:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+
+.run-row[data-selected="true"] {
+  background: rgb(117 167 255 / 12%);
+  border-color: rgb(117 167 255 / 60%);
+}
+
+.run-row[data-state="loading"] {
+  cursor: progress;
+}
+
+.run-row[data-state="error"] {
+  border-color: rgb(255 127 122 / 60%);
+}
+
+.run-row[data-state="quarantined"] {
+  border-color: rgb(255 190 105 / 52%);
+  cursor: not-allowed;
+  opacity: 0.78;
 }
 
 .run-row strong {
@@ -682,6 +716,30 @@ textarea {
   color: var(--muted);
   font-size: 0.76rem;
   overflow-wrap: anywhere;
+}
+
+.run-inspector-status {
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  bottom: 0;
+  color: var(--subtle);
+  font-size: 0.76rem;
+  line-height: 1.4;
+  padding: 8px 6px 2px;
+  position: sticky;
+  z-index: 1;
+}
+
+.run-inspector-status[data-state="loading"] {
+  color: var(--accent-2);
+}
+
+.run-inspector-status[data-state="loaded"] {
+  color: var(--accent);
+}
+
+.run-inspector-status[data-state="error"] {
+  color: var(--danger);
 }
 
 .thinking-panel {

@@ -8,9 +8,10 @@ description: Use when changing loop contracts, evidence context, retrieval, LLM 
 ## Purpose
 
 Use this skill to evolve the workbench without weakening its core promise: make
-agent loops observable, testable, private by default, and honest. Smart Evidence,
-web snippets, uploaded files, thread memory, and direct model knowledge are
-evidence providers; none of them is the whole product boundary.
+agent loops observable, testable, local-first, and honest. Smart Evidence may
+send lookup/current queries to DuckDuckGo; web snippets, uploaded files, thread
+memory, and direct model knowledge are evidence providers, and none of them is
+the whole product boundary.
 
 ## Operating Loop
 
@@ -85,8 +86,9 @@ evidence providers; none of them is the whole product boundary.
   actual query path: prompt evidence, draft, mechanical check, verifier outcome,
   retry/refusal state, and final answer.
 - Completed query reports should be retained in bounded in-memory `LoopSession`
-  state. Local JSONL export may write raw reports for developer replay/debug
-  artifacts; public UI traces must continue using the redacted report surface.
+  state. Local JSONL export may write raw reports for developer diagnostics and
+  future inspect/diff input; public UI traces must continue using the versioned,
+  allowlist-only public projection.
 - Web/API threads must pass an explicit validated `session_id` into the runtime.
   FastAPI owns local SQLite persistence for thread metadata, messages, durable
   public loop-run records, recipes, and latest public loop payloads. Recent

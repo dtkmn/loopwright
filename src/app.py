@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Callable, Optional, Sequence
@@ -33,6 +34,7 @@ try:
     from .document_config import MAX_DOCUMENT_BYTES
     from .thread_store import (
         DEFAULT_THREAD_TITLE,
+        QuarantinedLoopRunError,
         ThreadStore,
         safe_title,
     )
@@ -43,6 +45,7 @@ try:
         empty_query_response_dict,
         env_flag,
         normalize_text_encoding,
+        public_loop_payload_from_report,
         query_response_dict,
         runtime_status_dict,
         status_with_unexpected_upload_error,
@@ -53,6 +56,7 @@ except ImportError:
     from document_config import MAX_DOCUMENT_BYTES
     from thread_store import (
         DEFAULT_THREAD_TITLE,
+        QuarantinedLoopRunError,
         ThreadStore,
         safe_title,
     )
@@ -63,6 +67,7 @@ except ImportError:
         empty_query_response_dict,
         env_flag,
         normalize_text_encoding,
+        public_loop_payload_from_report,
         query_response_dict,
         runtime_status_dict,
         status_with_unexpected_upload_error,
@@ -105,6 +110,23 @@ class ThreadCreateRequest(BaseModel):
 
 class ThreadUpdateRequest(BaseModel):
     title: Optional[str] = None
+
+
+@dataclass
+class _QuerySessionGate:
+    lock: object = field(default_factory=threading.Lock)
+    references: int = 0
+
+
+@dataclass(frozen=True)
+class _RuntimeIdentity:
+    instance_id: str
+    generation: int
+
+
+@dataclass
+class _SharedRuntimeOwnership:
+    session_id: Optional[str] = None
 
 
 class RecipeWriteRequest(BaseModel):
@@ -203,7 +225,17 @@ def title_from_message(message: str) -> str:
 
 
 def thread_detail_response(thread) -> dict:
-    return thread.detail_dict()
+    payload = thread.detail_dict()
+    payload["latest"] = None
+    for run in thread.loop_runs:
+        if getattr(run, "quarantine_reason", None):
+            continue
+        try:
+            payload["latest"] = public_loop_payload_from_report(run.public_report)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        break
+    return payload
 
 
 def thread_summary_response(thread) -> dict:
@@ -344,23 +376,163 @@ def create_app(
         )
     )
     scoped_runtimes: dict[str, AILoopEngine] = {}
+    scoped_runtime_identities: dict[str, Optional[_RuntimeIdentity]] = {}
+    shared_runtime_identities: dict[str, _RuntimeIdentity] = {}
+    shared_runtime_ownership = _SharedRuntimeOwnership()
     scoped_runtime_lock = threading.Lock()
+    deleting_runtime_sessions: set[str] = set()
+    clearing_runtime_sessions: set[str] = set()
+    refreshing_runtime_sessions: set[str] = set()
+    unusable_shared_runtime_sessions: set[str] = set()
+    query_gate_lock = threading.Lock()
+    query_gates: dict[str, _QuerySessionGate] = {}
 
     def build_runtime(session_id: str) -> AILoopEngine:
         if engine_factory is not None:
             return engine_factory(session_id)
         return AILoopEngine(fast_mode=env_flag("FAST_MODE", False))
 
-    def runtime(session_id: str = "default") -> AILoopEngine:
-        if engine is not None:
-            return engine
+    def claim_shared_runtime_owner_locked(session_id: str) -> None:
+        if engine is None:
+            return
+        owner_session_id = shared_runtime_ownership.session_id
+        if owner_session_id is None:
+            shared_runtime_ownership.session_id = session_id
+            return
+        if owner_session_id != session_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Caller-injected runtime is already bound to another thread. "
+                    "Use engine_factory for isolated multi-thread runtimes."
+                ),
+            )
+
+    def runtime(
+        session_id: str = "default",
+        *,
+        expected_instance_id: Optional[str] = None,
+        expected_generation: Optional[int] = None,
+    ) -> AILoopEngine:
+        if (expected_instance_id is None) != (expected_generation is None):
+            raise ValueError(
+                "expected_instance_id and expected_generation must be supplied "
+                "together."
+            )
         safe_id = str(session_id or "default").strip() or "default"
+        expected_identity = (
+            _RuntimeIdentity(expected_instance_id, expected_generation)
+            if expected_instance_id is not None
+            and expected_generation is not None
+            else None
+        )
+        if expected_identity is not None:
+            durable_thread = threads().get_thread(safe_id)
+            if (
+                durable_thread is None
+                or durable_thread.instance_id != expected_identity.instance_id
+                or durable_thread.generation != expected_identity.generation
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread changed before its runtime could be acquired. "
+                        "Please retry in the active thread."
+                    ),
+                )
+        stale_runtime = None
+        refresh_runtime = None
         with scoped_runtime_lock:
-            current_runtime = scoped_runtimes.get(safe_id)
-            if current_runtime is None:
-                current_runtime = build_runtime(safe_id)
-                scoped_runtimes[safe_id] = current_runtime
-            return current_runtime
+            if (
+                safe_id in deleting_runtime_sessions
+                or safe_id in clearing_runtime_sessions
+                or safe_id in refreshing_runtime_sessions
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Thread lifecycle change is in progress. Please retry.",
+                )
+            claim_shared_runtime_owner_locked(safe_id)
+            if engine is not None and safe_id in unusable_shared_runtime_sessions:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Thread runtime cleanup failed and this session cannot be "
+                        "reused until cleanup succeeds."
+                    ),
+                )
+            if engine is not None:
+                bound_identity = shared_runtime_identities.get(safe_id)
+                if expected_identity is not None:
+                    if bound_identity is None:
+                        shared_runtime_identities[safe_id] = expected_identity
+                    elif bound_identity.instance_id != expected_identity.instance_id:
+                        unusable_shared_runtime_sessions.add(safe_id)
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Thread runtime belongs to a prior durable thread "
+                                "instance and cannot be reused."
+                            ),
+                        )
+                    elif bound_identity.generation < expected_identity.generation:
+                        shared_runtime_identities[safe_id] = expected_identity
+                        refreshing_runtime_sessions.add(safe_id)
+                        refresh_runtime = engine
+                current_runtime = engine
+            else:
+                current_runtime = scoped_runtimes.get(safe_id)
+                bound_identity = scoped_runtime_identities.get(safe_id)
+                if (
+                    current_runtime is not None
+                    and expected_identity is not None
+                    and bound_identity is not None
+                    and bound_identity.instance_id
+                    != expected_identity.instance_id
+                ):
+                    stale_runtime = current_runtime
+                    scoped_runtimes.pop(safe_id, None)
+                    scoped_runtime_identities.pop(safe_id, None)
+                    current_runtime = None
+                elif (
+                    current_runtime is not None
+                    and expected_identity is not None
+                    and bound_identity is not None
+                    and bound_identity.generation < expected_identity.generation
+                ):
+                    scoped_runtime_identities[safe_id] = expected_identity
+                    refreshing_runtime_sessions.add(safe_id)
+                    refresh_runtime = current_runtime
+                if current_runtime is None:
+                    current_runtime = build_runtime(safe_id)
+                    scoped_runtimes[safe_id] = current_runtime
+                    scoped_runtime_identities[safe_id] = expected_identity
+                elif expected_identity is not None and bound_identity is None:
+                    scoped_runtime_identities[safe_id] = expected_identity
+        if stale_runtime is not None:
+            try:
+                clean_runtime_session(safe_id, stale_runtime)
+            except Exception:
+                LOGGER.exception(
+                    "Failed to clean up runtime from prior thread instance %s.",
+                    safe_id,
+                )
+        if refresh_runtime is not None:
+            try:
+                clean_runtime_session(safe_id, refresh_runtime)
+            except Exception:
+                isolate_runtime_after_cleanup_failure(safe_id, refresh_runtime)
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Thread runtime could not be refreshed after its durable "
+                        "history changed."
+                    ),
+                ) from None
+            finally:
+                with scoped_runtime_lock:
+                    refreshing_runtime_sessions.discard(safe_id)
+        return current_runtime
 
     def loaded_runtime(session_id: str = "default") -> Optional[AILoopEngine]:
         if engine is not None:
@@ -368,6 +540,61 @@ def create_app(
         safe_id = str(session_id or "default").strip() or "default"
         with scoped_runtime_lock:
             return scoped_runtimes.get(safe_id)
+
+    def reject_session_lifecycle_change(session_id: str) -> None:
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            if (
+                safe_id in deleting_runtime_sessions
+                or safe_id in clearing_runtime_sessions
+                or safe_id in refreshing_runtime_sessions
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Thread lifecycle change is in progress. Please retry.",
+                )
+
+    def begin_session_deletion(session_id: str) -> Optional[AILoopEngine]:
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            if (
+                safe_id in deleting_runtime_sessions
+                or safe_id in clearing_runtime_sessions
+                or safe_id in refreshing_runtime_sessions
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Thread lifecycle change is already in progress.",
+                )
+            claim_shared_runtime_owner_locked(safe_id)
+            deleting_runtime_sessions.add(safe_id)
+            return engine if engine is not None else scoped_runtimes.get(safe_id)
+
+    def end_session_deletion(session_id: str) -> None:
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            deleting_runtime_sessions.discard(safe_id)
+
+    def begin_session_clear(session_id: str) -> Optional[AILoopEngine]:
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            if (
+                safe_id in deleting_runtime_sessions
+                or safe_id in clearing_runtime_sessions
+                or safe_id in refreshing_runtime_sessions
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Thread lifecycle change is already in progress.",
+                )
+            claim_shared_runtime_owner_locked(safe_id)
+            clearing_runtime_sessions.add(safe_id)
+            return engine if engine is not None else scoped_runtimes.get(safe_id)
+
+    def end_session_clear(session_id: str) -> None:
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            clearing_runtime_sessions.discard(safe_id)
 
     def drop_runtime(
         session_id: str,
@@ -381,16 +608,181 @@ def create_app(
             current_runtime = scoped_runtimes.get(safe_id)
             if expected_runtime is None or current_runtime is expected_runtime:
                 scoped_runtimes.pop(safe_id, None)
+                scoped_runtime_identities.pop(safe_id, None)
+
+    def bind_runtime_identity(
+        session_id: str,
+        current_runtime: Optional[AILoopEngine],
+        *,
+        instance_id: str,
+        generation: int,
+    ) -> bool:
+        if current_runtime is None:
+            return True
+        safe_id = str(session_id or "default").strip() or "default"
+        identity = _RuntimeIdentity(instance_id, generation)
+        with scoped_runtime_lock:
+            if engine is not None:
+                if current_runtime is engine:
+                    claim_shared_runtime_owner_locked(safe_id)
+                    bound_identity = shared_runtime_identities.get(safe_id)
+                    if (
+                        bound_identity is not None
+                        and bound_identity.instance_id != identity.instance_id
+                    ):
+                        unusable_shared_runtime_sessions.add(safe_id)
+                        return False
+                    shared_runtime_identities[safe_id] = identity
+                    unusable_shared_runtime_sessions.discard(safe_id)
+                return True
+            if scoped_runtimes.get(safe_id) is current_runtime:
+                bound_identity = scoped_runtime_identities.get(safe_id)
+                if (
+                    bound_identity is not None
+                    and bound_identity.instance_id != identity.instance_id
+                ):
+                    scoped_runtimes.pop(safe_id, None)
+                    scoped_runtime_identities.pop(safe_id, None)
+                    return False
+                scoped_runtime_identities[safe_id] = identity
+            return True
+
+    def retire_runtime_session(
+        session_id: str,
+        current_runtime: Optional[AILoopEngine],
+    ) -> None:
+        drop_runtime(session_id, expected_runtime=current_runtime)
+        if engine is None or current_runtime is not engine:
+            return
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            # A caller-injected shared engine cannot prove that thread-owned
+            # document/index state was erased. Preserve its prior owner witness
+            # and fail closed for any same-id replacement instead of allowing a
+            # later clear to rebind private state to a different instance.
+            unusable_shared_runtime_sessions.add(safe_id)
+
+    def retire_runtime_session_if_bound(
+        session_id: str,
+        current_runtime: Optional[AILoopEngine],
+        *,
+        expected_identity: _RuntimeIdentity,
+    ) -> bool:
+        """Retire a runtime only while it still belongs to the stale caller."""
+        if current_runtime is None:
+            return False
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            if engine is not None:
+                if (
+                    current_runtime is not engine
+                    or shared_runtime_identities.get(safe_id) != expected_identity
+                ):
+                    return False
+                # Preserve the ownership witness for caller-injected runtimes;
+                # their thread-owned state cannot be proven erased here.
+                unusable_shared_runtime_sessions.add(safe_id)
+                return True
+            if (
+                scoped_runtimes.get(safe_id) is not current_runtime
+                or scoped_runtime_identities.get(safe_id) != expected_identity
+            ):
+                return False
+            scoped_runtimes.pop(safe_id, None)
+            scoped_runtime_identities.pop(safe_id, None)
+            return True
+
+    def release_runtime_after_pristine_rollback(
+        session_id: str,
+        current_runtime: Optional[AILoopEngine],
+    ) -> None:
+        if current_runtime is None:
+            return
+        if engine is None:
+            drop_runtime(session_id, expected_runtime=current_runtime)
+            return
+        if current_runtime is not engine:
+            return
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            shared_runtime_identities.pop(safe_id, None)
+            unusable_shared_runtime_sessions.discard(safe_id)
+
+    def clean_runtime_session(
+        session_id: str,
+        current_runtime: Optional[AILoopEngine],
+    ) -> None:
+        if current_runtime is None:
+            return
+        try:
+            clear_loop_session = getattr(
+                current_runtime,
+                "clear_loop_session",
+                None,
+            )
+            if callable(clear_loop_session):
+                clear_loop_session(session_id)
+        finally:
+            clear_chat_history_for_session(current_runtime, session_id)
+
+    def mark_runtime_cleanup_succeeded(session_id: str) -> None:
+        if engine is None:
+            return
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            unusable_shared_runtime_sessions.discard(safe_id)
+
+    def isolate_runtime_after_cleanup_failure(
+        session_id: str,
+        current_runtime: Optional[AILoopEngine],
+    ) -> None:
+        drop_runtime(session_id, expected_runtime=current_runtime)
+        if engine is None:
+            return
+        safe_id = str(session_id or "default").strip() or "default"
+        with scoped_runtime_lock:
+            unusable_shared_runtime_sessions.add(safe_id)
+
+    def clean_stale_query_runtime(
+        session_id: str,
+        current_runtime: Optional[AILoopEngine],
+        *,
+        expected_identity: _RuntimeIdentity,
+    ) -> None:
+        if current_runtime is None:
+            return
+        try:
+            clean_runtime_session(session_id, current_runtime)
+        except Exception:
+            isolate_runtime_after_cleanup_failure(
+                session_id,
+                current_runtime,
+            )
+            LOGGER.exception(
+                "Failed to isolate stale query runtime for %s.",
+                session_id,
+            )
+            return
+        retire_runtime_session_if_bound(
+            session_id,
+            current_runtime,
+            expected_identity=expected_identity,
+        )
 
     def thread_instance_is_current(
         session_id: str,
         *,
         expected_instance_id: str,
+        expected_generation: Optional[int] = None,
     ) -> bool:
         thread = threads().get_thread(session_id)
         return (
             thread is not None
             and thread.instance_id == expected_instance_id
+            and (
+                expected_generation is None
+                or thread.generation == expected_generation
+            )
         )
 
     def stale_upload_response(
@@ -399,7 +791,7 @@ def create_app(
         upload_runtime: Optional[AILoopEngine] = None,
     ) -> JSONResponse:
         if upload_runtime is not None:
-            drop_runtime(session_id, expected_runtime=upload_runtime)
+            retire_runtime_session(session_id, upload_runtime)
         return JSONResponse(
             {
                 "detail": (
@@ -412,6 +804,84 @@ def create_app(
 
     def threads() -> ThreadStore:
         return resolved_thread_store if resolved_thread_store is not None else get_thread_store()
+
+    def acquire_query_gate(session_id: str) -> _QuerySessionGate:
+        """Serialize queries within one session while preserving cross-session work."""
+
+        with query_gate_lock:
+            gate = query_gates.get(session_id)
+            if gate is None:
+                gate = _QuerySessionGate()
+                query_gates[session_id] = gate
+            gate.references += 1
+        gate.lock.acquire()
+        return gate
+
+    def release_query_gate(session_id: str, gate: _QuerySessionGate) -> None:
+        gate.lock.release()
+        with query_gate_lock:
+            gate.references -= 1
+            if gate.references == 0 and query_gates.get(session_id) is gate:
+                query_gates.pop(session_id, None)
+
+    def discard_unpersisted_runtime_run(
+        current_runtime: Optional[object],
+        *,
+        session_id: str,
+        run_id: Optional[str],
+    ) -> None:
+        if current_runtime is None or not run_id:
+            return
+        discard = getattr(current_runtime, "discard_loop_run", None)
+        if not callable(discard):
+            return
+        try:
+            discard(session_id, run_id)
+        except Exception:
+            LOGGER.exception(
+                "Failed to discard unpersisted runtime run %s for %s.",
+                run_id,
+                session_id,
+            )
+
+    def rollback_owned_query_thread(
+        thread,
+        *,
+        created: bool,
+        current_runtime: Optional[object],
+    ) -> None:
+        if not created:
+            return
+        try:
+            deleted = threads().delete_empty_thread_if_current(
+                thread.id,
+                expected_instance_id=thread.instance_id,
+                expected_generation=thread.generation,
+                expected_updated_at=thread.updated_at,
+                expected_title=thread.title,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Failed to roll back pristine auto-created thread %s.",
+                thread.id,
+            )
+            return
+        if not deleted or current_runtime is None:
+            return
+        try:
+            if engine is not None:
+                if hasattr(current_runtime, "clear_loop_session"):
+                    current_runtime.clear_loop_session(thread.id)
+                clear_chat_history_for_session(current_runtime, thread.id)
+            release_runtime_after_pristine_rollback(
+                thread.id,
+                current_runtime,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Failed to clean up runtime for rolled-back thread %s.",
+                thread.id,
+            )
 
     @api.middleware("http")
     async def reject_oversized_upload_request(request: Request, call_next):
@@ -468,9 +938,50 @@ def create_app(
             or request.headers.get("x-session-id")
         )
         safe_id = safe_session_id(requested_session_id)
-        if requested_session_id and threads().get_thread(safe_id) is None:
+        status_thread = threads().get_thread(safe_id)
+        if requested_session_id and status_thread is None:
             raise HTTPException(status_code=404, detail="Thread not found.")
-        return runtime_status_dict(runtime(safe_id).status())
+        status_runtime = runtime(
+            safe_id,
+            expected_instance_id=(
+                status_thread.instance_id if status_thread is not None else None
+            ),
+            expected_generation=(
+                status_thread.generation if status_thread is not None else None
+            ),
+        )
+        status_payload = runtime_status_dict(status_runtime.status())
+        current_status_thread = (
+            threads().get_thread(safe_id) if status_thread is not None else None
+        )
+        if status_thread is not None and (
+            current_status_thread is None
+            or current_status_thread.instance_id != status_thread.instance_id
+            or current_status_thread.generation != status_thread.generation
+        ):
+            # A same-instance generation advance preserves the attached
+            # document. The advancing request may not have rebound this runtime
+            # yet, so retire only when the durable thread itself was replaced.
+            if (
+                current_status_thread is None
+                or current_status_thread.instance_id != status_thread.instance_id
+            ):
+                retire_runtime_session_if_bound(
+                    safe_id,
+                    status_runtime,
+                    expected_identity=_RuntimeIdentity(
+                        status_thread.instance_id,
+                        status_thread.generation,
+                    ),
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Thread changed before runtime status completed. "
+                    "Please retry in the active thread."
+                ),
+            )
+        return status_payload
 
     @api.get("/api/threads")
     def list_threads() -> dict:
@@ -506,16 +1017,87 @@ def create_app(
     @api.delete("/api/threads/{thread_id}")
     def delete_thread(thread_id: str) -> dict:
         safe_id = safe_session_id(thread_id)
-        deleted = threads().delete_thread(safe_id)
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Thread not found.")
-        current_engine = loaded_runtime(safe_id)
-        if current_engine is not None:
-            if hasattr(current_engine, "clear_loop_session"):
-                current_engine.clear_loop_session(safe_id)
-            clear_chat_history_for_session(current_engine, safe_id)
-        drop_runtime(safe_id)
-        return {"deleted": True, "thread_id": safe_id}
+        store = threads()
+        deleted_runtime = begin_session_deletion(safe_id)
+        try:
+            observed_thread = store.get_thread(safe_id)
+            if observed_thread is None:
+                try:
+                    clean_runtime_session(safe_id, deleted_runtime)
+                    mark_runtime_cleanup_succeeded(safe_id)
+                except Exception:
+                    isolate_runtime_after_cleanup_failure(
+                        safe_id,
+                        deleted_runtime,
+                    )
+                    LOGGER.exception(
+                        "Failed to clean up stale runtime for missing thread %s.",
+                        safe_id,
+                    )
+                finally:
+                    retire_runtime_session(safe_id, deleted_runtime)
+                if store.get_thread(safe_id) is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Thread was recreated while deletion completed. "
+                            "Please retry in the active thread."
+                        ),
+                    )
+                raise HTTPException(status_code=404, detail="Thread not found.")
+            deleted = store.delete_thread(
+                safe_id,
+                expected_instance_id=observed_thread.instance_id,
+                expected_generation=observed_thread.generation,
+            )
+            if not deleted:
+                try:
+                    clean_runtime_session(safe_id, deleted_runtime)
+                    mark_runtime_cleanup_succeeded(safe_id)
+                except Exception:
+                    isolate_runtime_after_cleanup_failure(
+                        safe_id,
+                        deleted_runtime,
+                    )
+                    LOGGER.exception(
+                        "Failed to clean up stale runtime after deletion CAS "
+                        "mismatch for %s.",
+                        safe_id,
+                    )
+                finally:
+                    retire_runtime_session(safe_id, deleted_runtime)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread changed before deletion completed. "
+                        "Please retry in the active thread."
+                    ),
+                )
+            try:
+                clean_runtime_session(safe_id, deleted_runtime)
+                mark_runtime_cleanup_succeeded(safe_id)
+            except Exception:
+                isolate_runtime_after_cleanup_failure(
+                    safe_id,
+                    deleted_runtime,
+                )
+                LOGGER.exception(
+                    "Thread %s was deleted, but its old runtime cleanup failed.",
+                    safe_id,
+                )
+            finally:
+                retire_runtime_session(safe_id, deleted_runtime)
+            if store.get_thread(safe_id) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread was recreated while deletion completed. "
+                        "Please retry in the active thread."
+                    ),
+                )
+            return {"deleted": True, "thread_id": safe_id}
+        finally:
+            end_session_deletion(safe_id)
 
     @api.get("/api/threads/{thread_id}/runs")
     def list_thread_runs(thread_id: str) -> dict:
@@ -537,7 +1119,13 @@ def create_app(
         run = threads().get_loop_run(safe_id, safe_run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Loop run not found.")
-        return loop_run_detail_response(run)
+        try:
+            return loop_run_detail_response(run)
+        except QuarantinedLoopRunError:
+            raise HTTPException(
+                status_code=409,
+                detail="Stored loop run is quarantined and cannot be inspected.",
+            ) from None
 
     @api.get("/api/recipes")
     def list_recipes() -> dict:
@@ -641,6 +1229,7 @@ def create_app(
         if upload_thread is None:
             raise HTTPException(status_code=404, detail="Thread not found.")
         expected_instance_id = upload_thread.instance_id
+        expected_generation = upload_thread.generation
         uploaded_name = safe_upload_name(file.filename)
         selected_encoding = normalize_text_encoding(text_encoding)
         if selected_encoding is None:
@@ -654,7 +1243,11 @@ def create_app(
                 expected_instance_id=expected_instance_id,
             ):
                 return stale_upload_response(safe_id)
-            current_engine = runtime(safe_id)
+            current_engine = runtime(
+                safe_id,
+                expected_instance_id=expected_instance_id,
+                expected_generation=expected_generation,
+            )
             pre_upload_status = current_engine.status()
             try:
                 qa_status = current_engine.process_document(
@@ -724,34 +1317,69 @@ def create_app(
             raise HTTPException(status_code=400, detail="Message is required.")
         session_id = safe_session_id(request.session_id)
         store = threads()
-        thread = store.ensure_thread(session_id)
-        recipe_id = (
-            safe_path_id(request.recipe_id, label="recipe id")
-            if request.recipe_id
-            else DEFAULT_LOOP_RECIPE_ID
-        )
-        if recipe_id == DEFAULT_LOOP_RECIPE_ID:
-            recipe = store.ensure_default_recipe()
-        else:
-            recipe = store.get_recipe(recipe_id)
-        if recipe is None:
-            raise HTTPException(status_code=404, detail="Recipe not found.")
-        expected_generation = thread.generation
-        recent_messages = store.recent_messages(
-            session_id,
-            limit=MAX_QUERY_HISTORY_MESSAGES,
-        )
-        conversation_history = conversation_history_from_messages(recent_messages)
-        current_runtime = runtime(session_id)
-        semantic_memory, semantic_memory_status = semantic_memory_context_for_query(
-            current_runtime,
-            store,
-            session_id=session_id,
-            message=message,
-            exclude_message_ids=tuple(message.id for message in recent_messages),
-        )
-        payload = query_response_dict(
-            query_result := current_runtime.query_with_trace(
+        query_gate = acquire_query_gate(session_id)
+        thread = None
+        thread_created = False
+        current_runtime = None
+        runtime_run_id = None
+        turn_persisted = False
+        request_succeeded = False
+
+        try:
+            reject_session_lifecycle_change(session_id)
+            thread, thread_created = store.ensure_thread_with_created(session_id)
+            recipe_id = (
+                safe_path_id(request.recipe_id, label="recipe id")
+                if request.recipe_id
+                else DEFAULT_LOOP_RECIPE_ID
+            )
+            if recipe_id == DEFAULT_LOOP_RECIPE_ID:
+                recipe = store.ensure_default_recipe()
+            else:
+                recipe = store.get_recipe(recipe_id)
+            if recipe is None:
+                raise HTTPException(status_code=404, detail="Recipe not found.")
+            expected_generation = thread.generation
+            recent_messages = store.recent_messages(
+                session_id,
+                limit=MAX_QUERY_HISTORY_MESSAGES,
+            )
+            conversation_history = conversation_history_from_messages(recent_messages)
+            current_runtime = runtime(
+                session_id,
+                expected_instance_id=thread.instance_id,
+                expected_generation=expected_generation,
+            )
+            semantic_memory, semantic_memory_status = semantic_memory_context_for_query(
+                current_runtime,
+                store,
+                session_id=session_id,
+                message=message,
+                exclude_message_ids=tuple(message.id for message in recent_messages),
+            )
+            current_thread = store.get_thread(session_id)
+            if (
+                current_thread is None
+                or current_thread.instance_id != thread.instance_id
+                or current_thread.generation != expected_generation
+            ):
+                clean_stale_query_runtime(
+                    session_id,
+                    current_runtime,
+                    expected_identity=_RuntimeIdentity(
+                        thread.instance_id,
+                        expected_generation,
+                    ),
+                )
+                current_runtime = None
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread changed before query inference began. "
+                        "Please retry in the active thread."
+                    ),
+                )
+            query_result = current_runtime.query_with_trace(
                 message,
                 session_id=session_id,
                 conversation_history=conversation_history,
@@ -760,51 +1388,156 @@ def create_app(
                 loop_recipe=recipe.runtime_dict(),
                 context_provider=request.context_provider,
             )
-        )
-        raw_loop_report = (
-            query_result.loop_report.to_dict() if query_result.loop_report else None
-        )
-        public_loop_report = (
-            query_result.loop_report.to_public_dict()
-            if query_result.loop_report
-            else None
-        )
-        persisted_turn = store.append_turn(
-            session_id,
-            user_content=message,
-            assistant_content=str(payload.get("answer") or ""),
-            thinking=(payload.get("trace") or {}).get("model_thinking"),
-            loop_payload=payload,
-            raw_loop_report=raw_loop_report,
-            public_loop_report=public_loop_report,
-            expected_generation=expected_generation,
-            expected_instance_id=thread.instance_id,
-            title_if_empty=title_from_message(message),
-        )
-        if persisted_turn:
+            if query_result.loop_report is None:
+                LOGGER.error(
+                    "Query runtime returned no loop report for session %s.",
+                    session_id,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Canonical loop report unavailable.",
+                )
+            runtime_run_id = query_result.loop_report.run.run_id
+            payload = query_response_dict(query_result)
+            raw_loop_report = query_result.loop_report.to_dict()
+            public_loop_report = query_result.loop_report.to_public_dict()
+            recipe_summary = recipe.summary_dict()
+            persisted_turn = store.append_turn(
+                session_id,
+                user_content=message,
+                assistant_content=str(payload.get("answer") or ""),
+                thinking=(payload.get("trace") or {}).get("model_thinking"),
+                loop_payload=None,
+                raw_loop_report=raw_loop_report,
+                public_loop_report=public_loop_report,
+                expected_generation=expected_generation,
+                expected_instance_id=thread.instance_id,
+                title_if_empty=title_from_message(message),
+            )
+            if persisted_turn is None:
+                clean_stale_query_runtime(
+                    session_id,
+                    current_runtime,
+                    expected_identity=_RuntimeIdentity(
+                        thread.instance_id,
+                        expected_generation,
+                    ),
+                )
+                current_runtime = None
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread changed before query persistence completed. "
+                        "Please retry in the active thread."
+                    ),
+                )
+            turn_persisted = True
             index_thread_memory(current_runtime, store, persisted_turn)
             updated_thread = store.get_thread(session_id)
             if updated_thread is not None:
                 payload["thread"] = thread_summary_response(updated_thread)
-            if raw_loop_report:
-                run_id = ((raw_loop_report.get("run") or {}).get("run_id"))
-                if run_id:
-                    persisted_run = store.get_loop_run(session_id, str(run_id))
-                    if persisted_run is not None:
-                        payload["run"] = persisted_run.summary_dict()
-        payload["recipe"] = recipe.summary_dict()
-        return payload
+            run_id = ((raw_loop_report.get("run") or {}).get("run_id"))
+            if run_id:
+                persisted_run = store.get_loop_run(session_id, str(run_id))
+                if persisted_run is not None:
+                    payload["run"] = persisted_run.summary_dict()
+            payload["recipe"] = recipe_summary
+            request_succeeded = True
+            return payload
+        finally:
+            if not request_succeeded and not turn_persisted:
+                discard_unpersisted_runtime_run(
+                    current_runtime,
+                    session_id=session_id,
+                    run_id=runtime_run_id,
+                )
+                if thread is not None:
+                    rollback_owned_query_thread(
+                        thread,
+                        created=thread_created,
+                        current_runtime=current_runtime,
+                    )
+            release_query_gate(session_id, query_gate)
 
     @api.post("/api/chat/clear")
     def clear_chat(request: Optional[ClearChatRequest] = Body(default=None)) -> dict:
         session_id = safe_session_id(request.session_id if request else None)
-        current_engine = loaded_runtime(session_id)
-        if current_engine is not None:
-            if hasattr(current_engine, "clear_loop_session"):
-                current_engine.clear_loop_session(session_id)
-            clear_chat_history_for_session(current_engine, session_id)
-        threads().clear_thread(session_id)
-        return empty_query_response_dict()
+        store = threads()
+        cleared_runtime = begin_session_clear(session_id)
+        try:
+            observed_thread = store.get_thread(session_id)
+            cleared_thread = None
+            if observed_thread is not None:
+                cleared_thread = store.clear_thread(
+                    session_id,
+                    expected_instance_id=observed_thread.instance_id,
+                    expected_generation=observed_thread.generation,
+                )
+                if cleared_thread is None:
+                    try:
+                        clean_runtime_session(session_id, cleared_runtime)
+                        mark_runtime_cleanup_succeeded(session_id)
+                    except Exception:
+                        isolate_runtime_after_cleanup_failure(
+                            session_id,
+                            cleared_runtime,
+                        )
+                        LOGGER.exception(
+                            "Failed to clean up stale runtime after clear CAS "
+                            "mismatch for %s.",
+                            session_id,
+                        )
+                    finally:
+                        retire_runtime_session(session_id, cleared_runtime)
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Thread changed before clear completed. "
+                            "Please retry in the active thread."
+                        ),
+                    )
+            try:
+                clean_runtime_session(session_id, cleared_runtime)
+                mark_runtime_cleanup_succeeded(session_id)
+            except Exception:
+                isolate_runtime_after_cleanup_failure(
+                    session_id,
+                    cleared_runtime,
+                )
+                raise
+            if cleared_thread is None:
+                retire_runtime_session(session_id, cleared_runtime)
+            else:
+                bind_runtime_identity(
+                    session_id,
+                    cleared_runtime,
+                    instance_id=cleared_thread.instance_id,
+                    generation=cleared_thread.generation,
+                )
+            current_thread = store.get_thread(session_id)
+            if (
+                current_thread is not None
+                and (
+                    cleared_thread is None
+                    or current_thread.instance_id != cleared_thread.instance_id
+                    or current_thread.generation != cleared_thread.generation
+                    or current_thread.updated_at != cleared_thread.updated_at
+                    or current_thread.message_count != 0
+                    or current_thread.memory_count != 0
+                    or current_thread.loop_run_count != 0
+                )
+            ):
+                retire_runtime_session(session_id, cleared_runtime)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Thread was recreated while clear completed. "
+                        "Please retry in the active thread."
+                    ),
+                )
+            return empty_query_response_dict()
+        finally:
+            end_session_clear(session_id)
 
     return api
 

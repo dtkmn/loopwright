@@ -44,6 +44,9 @@ class LoopEvalCaseResult:
     passed: bool
     answer: str
     expected_terms: List[str]
+    forbidden_terms: List[str]
+    forbidden_terms_present: List[str]
+    answer_contract_matched: Optional[bool]
     expect_refusal: bool
     self_check_outcome: Optional[str]
     self_check_reasons: List[str]
@@ -194,7 +197,12 @@ def _invalid_inline_citations(result: QueryResult) -> List[str]:
     ]
 
 
-def score_case(case: GoldenEvalCase, result: QueryResult) -> LoopEvalCaseResult:
+def score_case(
+    case: GoldenEvalCase,
+    result: QueryResult,
+    *,
+    enforce_answer_contract: bool,
+) -> LoopEvalCaseResult:
     self_check = result.trace.self_check
     self_check_outcome = self_check.outcome if self_check else None
     self_check_reasons = list(self_check.reasons) if self_check else []
@@ -203,6 +211,17 @@ def score_case(case: GoldenEvalCase, result: QueryResult) -> LoopEvalCaseResult:
     final_decision = _final_decision(result)
     answer_lower = result.answer.lower()
     citation_count = len(result.trace.citations)
+    forbidden_terms_present = [
+        forbidden_term
+        for forbidden_term in case.forbidden_terms
+        if forbidden_term.lower() in answer_lower
+    ]
+    answer_contract_matched = None
+    if enforce_answer_contract:
+        answer_contract_matched = not case.accepted_answer_patterns or any(
+            re.fullmatch(pattern, result.answer.strip(), flags=re.IGNORECASE)
+            for pattern in case.accepted_answer_patterns
+        )
 
     if invalid_inline_citations and "invalid_inline_citation" not in self_check_reasons:
         self_check_reasons.append("invalid_inline_citation")
@@ -233,6 +252,8 @@ def score_case(case: GoldenEvalCase, result: QueryResult) -> LoopEvalCaseResult:
         )
         passed = (
             expected_terms_present
+            and answer_contract_matched is not False
+            and not forbidden_terms_present
             and inline_citation_present
             and not invalid_inline_citations
             and citation_count > 0
@@ -248,6 +269,9 @@ def score_case(case: GoldenEvalCase, result: QueryResult) -> LoopEvalCaseResult:
         passed=passed,
         answer=result.answer,
         expected_terms=list(case.expected_terms),
+        forbidden_terms=list(case.forbidden_terms),
+        forbidden_terms_present=forbidden_terms_present,
+        answer_contract_matched=answer_contract_matched,
         expect_refusal=case.expect_refusal,
         self_check_outcome=self_check_outcome,
         self_check_reasons=self_check_reasons,
@@ -266,6 +290,9 @@ def failed_case(case: GoldenEvalCase, error: Exception) -> LoopEvalCaseResult:
         passed=False,
         answer="",
         expected_terms=list(case.expected_terms),
+        forbidden_terms=list(case.forbidden_terms),
+        forbidden_terms_present=[],
+        answer_contract_matched=None,
         expect_refusal=case.expect_refusal,
         self_check_outcome=None,
         self_check_reasons=[],
@@ -326,6 +353,7 @@ def evaluate_model(
                                 case.question,
                                 context_provider="document",
                             ),
+                            enforce_answer_contract=mode == "fake",
                         )
                     )
                 except Exception as exc:

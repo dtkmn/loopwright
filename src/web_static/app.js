@@ -9,6 +9,313 @@ const MAX_THREAD_MESSAGES = 100;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/;
 const QUERY_PROGRESS_INTERVAL_MS = 1000;
 const DEFAULT_TEXT_ENCODING = "auto";
+const PUBLIC_REPORT_SOURCE_SCHEMA = "loop-report/v1";
+const PUBLIC_REPORT_PROJECTION_SCHEMA = "loop-public-report/v1";
+const PUBLIC_REDACTION_REASON = "terminal_public_redaction";
+const PUBLIC_REDACTION_TEXT = "[redacted: terminal decision]";
+const SELF_CHECK_REFUSAL_ANSWER =
+  "I could not find enough relevant information in the provided evidence to answer that.";
+const PUBLIC_EVIDENCE_ID_PATTERN = /^evidence_[0-9a-f]{64}$/;
+const PUBLIC_CATEGORY_PATTERN = /^[a-z][a-z0-9_.:-]{0,63}$/;
+const PUBLIC_CONTEXT_PROVIDERS = new Set(["document", "none", "web"]);
+const PUBLIC_EVIDENCE_PROVIDERS = new Set(["document", "web"]);
+const PUBLIC_BACKENDS = new Set([
+  "auto",
+  "mock",
+  "ollama",
+  "openai-compatible",
+]);
+const PUBLIC_MEMORY_STATUSES = new Set([
+  "empty",
+  "not_requested",
+  "retrieved",
+  "unavailable",
+]);
+// Keep display-label blankness identical to the Python public projector.
+// Language-native trim functions disagree on NEL (U+0085) and BOM (U+FEFF).
+const PUBLIC_DISPLAY_BLANK_CODE_POINTS = new Set([
+  0x0020,
+  0x0085,
+  0x00a0,
+  0x1680,
+  0x2000,
+  0x2001,
+  0x2002,
+  0x2003,
+  0x2004,
+  0x2005,
+  0x2006,
+  0x2007,
+  0x2008,
+  0x2009,
+  0x200a,
+  0x2028,
+  0x2029,
+  0x202f,
+  0x205f,
+  0x3000,
+  0xfeff,
+]);
+// Unicode 15.0 General_Category=Cf ranges. Keep this explicit and mirrored in
+// the Python projector so runtime Unicode-table versions cannot diverge.
+const PUBLIC_DISPLAY_FORMAT_CODE_POINT_RANGES = Object.freeze([
+  [0x00ad, 0x00ad],
+  [0x0600, 0x0605],
+  [0x061c, 0x061c],
+  [0x06dd, 0x06dd],
+  [0x070f, 0x070f],
+  [0x0890, 0x0891],
+  [0x08e2, 0x08e2],
+  [0x180e, 0x180e],
+  [0x200b, 0x200f],
+  [0x202a, 0x202e],
+  [0x2060, 0x2064],
+  [0x2066, 0x206f],
+  [0xfeff, 0xfeff],
+  [0xfff9, 0xfffb],
+  [0x110bd, 0x110bd],
+  [0x110cd, 0x110cd],
+  [0x13430, 0x1343f],
+  [0x1bca0, 0x1bca3],
+  [0x1d173, 0x1d17a],
+  [0xe0001, 0xe0001],
+  [0xe0020, 0xe007f],
+]);
+// Unicode 15.0.0 General_Category=M (Mn, Mc, or Me). This exact token list
+// mirrors the Python projector. Marks are ignorable only for deciding whether
+// a label has a visible base; visible-base-plus-mark labels remain valid.
+const PUBLIC_DISPLAY_MARK_UNICODE_VERSION = "15.0.0";
+const PUBLIC_DISPLAY_MARK_CODE_POINT_RANGES = Object.freeze(
+  `
+0300-036F 0483-0489 0591-05BD 05BF 05C1-05C2 05C4-05C5 05C7 0610-061A 064B-065F 0670
+06D6-06DC 06DF-06E4 06E7-06E8 06EA-06ED 0711 0730-074A 07A6-07B0 07EB-07F3 07FD 0816-0819
+081B-0823 0825-0827 0829-082D 0859-085B 0898-089F 08CA-08E1 08E3-0903 093A-093C 093E-094F 0951-0957
+0962-0963 0981-0983 09BC 09BE-09C4 09C7-09C8 09CB-09CD 09D7 09E2-09E3 09FE 0A01-0A03
+0A3C 0A3E-0A42 0A47-0A48 0A4B-0A4D 0A51 0A70-0A71 0A75 0A81-0A83 0ABC 0ABE-0AC5
+0AC7-0AC9 0ACB-0ACD 0AE2-0AE3 0AFA-0AFF 0B01-0B03 0B3C 0B3E-0B44 0B47-0B48 0B4B-0B4D 0B55-0B57
+0B62-0B63 0B82 0BBE-0BC2 0BC6-0BC8 0BCA-0BCD 0BD7 0C00-0C04 0C3C 0C3E-0C44 0C46-0C48
+0C4A-0C4D 0C55-0C56 0C62-0C63 0C81-0C83 0CBC 0CBE-0CC4 0CC6-0CC8 0CCA-0CCD 0CD5-0CD6 0CE2-0CE3
+0CF3 0D00-0D03 0D3B-0D3C 0D3E-0D44 0D46-0D48 0D4A-0D4D 0D57 0D62-0D63 0D81-0D83 0DCA
+0DCF-0DD4 0DD6 0DD8-0DDF 0DF2-0DF3 0E31 0E34-0E3A 0E47-0E4E 0EB1 0EB4-0EBC 0EC8-0ECE
+0F18-0F19 0F35 0F37 0F39 0F3E-0F3F 0F71-0F84 0F86-0F87 0F8D-0F97 0F99-0FBC 0FC6
+102B-103E 1056-1059 105E-1060 1062-1064 1067-106D 1071-1074 1082-108D 108F 109A-109D 135D-135F
+1712-1715 1732-1734 1752-1753 1772-1773 17B4-17D3 17DD 180B-180D 180F 1885-1886 18A9
+1920-192B 1930-193B 1A17-1A1B 1A55-1A5E 1A60-1A7C 1A7F 1AB0-1ACE 1B00-1B04 1B34-1B44 1B6B-1B73
+1B80-1B82 1BA1-1BAD 1BE6-1BF3 1C24-1C37 1CD0-1CD2 1CD4-1CE8 1CED 1CF4 1CF7-1CF9 1DC0-1DFF
+20D0-20F0 2CEF-2CF1 2D7F 2DE0-2DFF 302A-302F 3099-309A A66F-A672 A674-A67D A69E-A69F A6F0-A6F1
+A802 A806 A80B A823-A827 A82C A880-A881 A8B4-A8C5 A8E0-A8F1 A8FF A926-A92D
+A947-A953 A980-A983 A9B3-A9C0 A9E5 AA29-AA36 AA43 AA4C-AA4D AA7B-AA7D AAB0 AAB2-AAB4
+AAB7-AAB8 AABE-AABF AAC1 AAEB-AAEF AAF5-AAF6 ABE3-ABEA ABEC-ABED FB1E FE00-FE0F FE20-FE2F
+101FD 102E0 10376-1037A 10A01-10A03 10A05-10A06 10A0C-10A0F 10A38-10A3A 10A3F 10AE5-10AE6 10D24-10D27
+10EAB-10EAC 10EFD-10EFF 10F46-10F50 10F82-10F85 11000-11002 11038-11046 11070 11073-11074 1107F-11082 110B0-110BA
+110C2 11100-11102 11127-11134 11145-11146 11173 11180-11182 111B3-111C0 111C9-111CC 111CE-111CF 1122C-11237
+1123E 11241 112DF-112EA 11300-11303 1133B-1133C 1133E-11344 11347-11348 1134B-1134D 11357 11362-11363
+11366-1136C 11370-11374 11435-11446 1145E 114B0-114C3 115AF-115B5 115B8-115C0 115DC-115DD 11630-11640 116AB-116B7
+1171D-1172B 1182C-1183A 11930-11935 11937-11938 1193B-1193E 11940 11942-11943 119D1-119D7 119DA-119E0 119E4
+11A01-11A0A 11A33-11A39 11A3B-11A3E 11A47 11A51-11A5B 11A8A-11A99 11C2F-11C36 11C38-11C3F 11C92-11CA7 11CA9-11CB6
+11D31-11D36 11D3A 11D3C-11D3D 11D3F-11D45 11D47 11D8A-11D8E 11D90-11D91 11D93-11D97 11EF3-11EF6 11F00-11F01
+11F03 11F34-11F3A 11F3E-11F42 13440 13447-13455 16AF0-16AF4 16B30-16B36 16F4F 16F51-16F87 16F8F-16F92
+16FE4 16FF0-16FF1 1BC9D-1BC9E 1CF00-1CF2D 1CF30-1CF46 1D165-1D169 1D16D-1D172 1D17B-1D182 1D185-1D18B 1D1AA-1D1AD
+1D242-1D244 1DA00-1DA36 1DA3B-1DA6C 1DA75 1DA84 1DA9B-1DA9F 1DAA1-1DAAF 1E000-1E006 1E008-1E018 1E01B-1E021
+1E023-1E024 1E026-1E02A 1E08F 1E130-1E136 1E2AE 1E2EC-1E2EF 1E4EC-1E4EF 1E8D0-1E8D6 1E944-1E94A E0100-E01EF
+  `.trim().split(/\s+/).map((token) => {
+    const [start, end = start] = token.split("-");
+    return [Number.parseInt(start, 16), Number.parseInt(end, 16)];
+  }),
+);
+const LOOP_RUN_PROJECTION_STATUSES = new Set(["available", "quarantined"]);
+const DEFAULT_QUARANTINE_REASON = "stored_loop_report_invalid";
+const LOOP_RUN_QUARANTINE_REASON_LABELS = new Map([
+  ["stored_loop_report_invalid", "Stored report failed validation."],
+  [
+    "legacy_visible_answer_unbound",
+    "Legacy visible answer lacks safe answer binding.",
+  ],
+]);
+const AVAILABLE_LOOP_RUN_SUMMARY_KEYS = Object.freeze([
+  "run_id",
+  "thread_id",
+  "projection_status",
+  "projection_schema_version",
+  "final_decision",
+  "terminal_reason",
+  "context_provider",
+  "backend",
+  "model",
+  "step_count",
+  "started_at",
+  "completed_at",
+  "created_at",
+]);
+const QUARANTINED_LOOP_RUN_SUMMARY_KEYS = Object.freeze([
+  "run_id",
+  "thread_id",
+  "created_at",
+  "projection_status",
+  "quarantine_reason",
+]);
+const PUBLIC_DETAIL_KEYS = Object.freeze([
+  "run_id",
+  "thread_id",
+  "projection_status",
+  "projection_schema_version",
+  "final_decision",
+  "terminal_reason",
+  "context_provider",
+  "backend",
+  "model",
+  "step_count",
+  "started_at",
+  "completed_at",
+  "created_at",
+  "report",
+  "public",
+]);
+const PUBLIC_REPORT_KEYS = Object.freeze([
+  "schema_version",
+  "projection_schema_version",
+  "public",
+  "public_redaction",
+  "run",
+]);
+const PUBLIC_REDACTION_KEYS = Object.freeze(["applied", "reason"]);
+const PUBLIC_RUN_KEYS = Object.freeze([
+  "run_id",
+  "session_id",
+  "context_provider",
+  "conversation_context_count",
+  "semantic_memory_count",
+  "semantic_memory_status",
+  "backend",
+  "model_label",
+  "policy",
+  "started_at",
+  "completed_at",
+  "steps",
+  "evidence",
+  "final_decision",
+  "terminal_reason",
+  "final_answer",
+  "error_present",
+]);
+const PUBLIC_POLICY_KEYS = Object.freeze([
+  "max_retries",
+  "require_citations",
+  "require_verifier_for_supported",
+  "allow_mock_supported",
+  "allow_tool_calls",
+  "require_human_review_for_tools",
+]);
+const PUBLIC_STEP_KEYS = Object.freeze([
+  "step_id",
+  "phase",
+  "decision",
+  "started_at",
+  "ended_at",
+  "duration_ms",
+  "backend",
+  "model_label",
+  "retry_count",
+  "error_present",
+  "verification",
+  "human_review_required",
+]);
+const PUBLIC_VERIFICATION_KEYS = Object.freeze([
+  "outcome",
+  "verifier_backend",
+  "verifier_model_label",
+  "same_model_as_drafter",
+]);
+const PUBLIC_EVIDENCE_KEYS = Object.freeze([
+  "evidence_id",
+  "citation_id",
+  "provider",
+  "locator",
+]);
+const PUBLIC_EVIDENCE_LOCATOR_KEYS = Object.freeze(["page", "chunk_index"]);
+const PUBLIC_PHASES = new Set([
+  "input",
+  "context_select",
+  "retrieve",
+  "draft",
+  "format_check",
+  "mechanical_check",
+  "verify",
+  "retry",
+  "refuse",
+  "final",
+  "error",
+]);
+const PUBLIC_DECISIONS = new Set([
+  "continue",
+  "retry",
+  "refuse",
+  "block",
+  "requires_review",
+  "supported",
+  "not_verified",
+  "final",
+  "error",
+]);
+const PUBLIC_FINAL_DECISIONS = new Set([
+  "final",
+  "supported",
+  "not_verified",
+  "refuse",
+  "block",
+  "requires_review",
+  "error",
+]);
+const PUBLIC_TERMINAL_DECISIONS = new Set([
+  "refuse",
+  "block",
+  "requires_review",
+]);
+const PUBLIC_FINAL_REASON_CONTRACT = new Map([
+  [null, new Set([null])],
+  ["final", new Set(["completed", "unspecified"])],
+  ["supported", new Set(["completed", "unspecified"])],
+  ["not_verified", new Set(["not_verified", "trace_unavailable", "unspecified"])],
+  [
+    "refuse",
+    new Set([
+      "verification_failed",
+      "retry_budget_exhausted",
+      "policy_refused",
+      "unspecified",
+    ]),
+  ],
+  ["block", new Set(["blocked", "unspecified"])],
+  ["requires_review", new Set(["human_review_required", "unspecified"])],
+  [
+    "error",
+    new Set([
+      "error",
+      "retry_budget_exhausted",
+      "trace_unavailable",
+      "unspecified",
+    ]),
+  ],
+]);
+const PUBLIC_TERMINAL_REASONS = new Set([
+  "completed",
+  "not_verified",
+  "verification_failed",
+  "retry_budget_exhausted",
+  "trace_unavailable",
+  "policy_refused",
+  "blocked",
+  "human_review_required",
+  "error",
+  "unspecified",
+]);
+const PUBLIC_VERIFICATION_OUTCOMES = new Set([
+  "supported",
+  "unsupported",
+  "insufficient",
+  "not_verified",
+  "error",
+]);
 
 const state = {
   threads: [],
@@ -18,7 +325,19 @@ const state = {
   recipeDraft: null,
   latest: null,
   runningQuery: null,
-  deletingThreadIds: new Set(),
+  threadSwitchRequestId: 0,
+  threadOperationRequestId: 0,
+  runInspection: {
+    requestId: 0,
+    threadId: null,
+    runId: null,
+    pendingRunId: null,
+    status: "idle",
+    message: "",
+  },
+  deletingThreadTokens: new Map(),
+  clearingThreadTokens: new Map(),
+  uploadThreadTokens: new Map(),
 };
 
 const elements = {
@@ -108,6 +427,12 @@ function emptyLoopPayload() {
     summary: {},
     trace: {},
   };
+}
+
+function objectRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
 }
 
 function safeText(value, fallback = "", maxLength = 120) {
@@ -380,23 +705,117 @@ function sanitizeMessage(message) {
   return sanitized;
 }
 
-function sanitizeLoopRun(rawRun) {
-  const runId = String(rawRun?.run_id || "");
+function quarantinedLoopRun(runId, quarantineReason = DEFAULT_QUARANTINE_REASON) {
   return {
-    run_id: SESSION_ID_PATTERN.test(runId) ? runId : "",
-    final_decision: String(rawRun?.final_decision || "unknown"),
-    context_provider: String(rawRun?.context_provider || "none"),
-    backend: String(rawRun?.backend || "unknown"),
-    model: String(rawRun?.model || rawRun?.model_label || "unknown"),
-    recipe_id: String(rawRun?.recipe_id || ""),
-    recipe_name: safeText(rawRun?.recipe_name, "General assistant loop", 96),
-    step_count: Number.isSafeInteger(Number(rawRun?.step_count))
-      ? Number(rawRun.step_count)
-      : 0,
-    started_at: String(rawRun?.started_at || ""),
-    completed_at: String(rawRun?.completed_at || ""),
-    created_at: String(rawRun?.created_at || ""),
+    run_id: runId,
+    projection_status: "quarantined",
+    quarantine_reason: quarantineReason,
+    final_decision: "quarantined",
+    context_provider: "unavailable",
+    backend: "unavailable",
+    model: "unavailable",
+    recipe_id: "",
+    recipe_name: "Stored loop run",
+    step_count: 0,
+    started_at: "",
+    completed_at: "",
+    created_at: "",
   };
+}
+
+function sanitizeLoopRun(rawRun, expectedThreadId) {
+  const runData = objectRecord(rawRun);
+  const rawRunId = runData.run_id;
+  const runId =
+    typeof rawRunId === "string" && SESSION_ID_PATTERN.test(rawRunId)
+      ? rawRunId
+      : "";
+  const rawProjectionStatus = runData.projection_status;
+  if (!LOOP_RUN_PROJECTION_STATUSES.has(rawProjectionStatus)) {
+    return quarantinedLoopRun(runId);
+  }
+  if (rawProjectionStatus === "quarantined") {
+    try {
+      exactPublicObject(runData, QUARANTINED_LOOP_RUN_SUMMARY_KEYS);
+      const threadId = publicString(runData.thread_id);
+      const quarantineReason = publicEnum(
+        runData.quarantine_reason,
+        new Set(LOOP_RUN_QUARANTINE_REASON_LABELS.keys()),
+      );
+      if (
+        !SESSION_ID_PATTERN.test(threadId) ||
+        threadId !== expectedThreadId ||
+        !runId
+      ) {
+        malformedPublicRunDetail();
+      }
+      publicTimestamp(runData.created_at);
+      return quarantinedLoopRun(runId, quarantineReason);
+    } catch {
+      return quarantinedLoopRun(runId);
+    }
+  }
+
+  try {
+    exactPublicObject(runData, AVAILABLE_LOOP_RUN_SUMMARY_KEYS);
+    const threadId = publicString(runData.thread_id);
+    const finalDecision = publicEnum(
+      runData.final_decision,
+      PUBLIC_FINAL_DECISIONS,
+      { nullable: true },
+    );
+    const terminalReason = publicEnum(
+      runData.terminal_reason,
+      PUBLIC_TERMINAL_REASONS,
+      { nullable: true },
+    );
+    const allowedReasons = PUBLIC_FINAL_REASON_CONTRACT.get(finalDecision);
+    const contextProvider = publicEnum(
+      runData.context_provider,
+      PUBLIC_CONTEXT_PROVIDERS,
+    );
+    const backend = publicEnum(runData.backend, PUBLIC_BACKENDS, {
+      nullable: true,
+    });
+    const model = publicDisplayLabel(runData.model, { nullable: true });
+    const stepCount = publicInteger(runData.step_count);
+    const startedAt = publicTimestamp(runData.started_at);
+    const completedAt = publicTimestamp(runData.completed_at, {
+      nullable: true,
+    });
+    const createdAt = publicTimestamp(runData.created_at);
+    if (
+      !runId ||
+      !SESSION_ID_PATTERN.test(threadId) ||
+      threadId !== expectedThreadId ||
+      runData.projection_schema_version !== PUBLIC_REPORT_PROJECTION_SCHEMA ||
+      !allowedReasons?.has(terminalReason) ||
+      (PUBLIC_TERMINAL_DECISIONS.has(finalDecision)
+        ? backend !== null || model !== null
+        : backend === null || model === null)
+    ) {
+      malformedPublicRunDetail();
+    }
+    return {
+      run_id: runId,
+      thread_id: threadId,
+      projection_status: "available",
+      projection_schema_version: PUBLIC_REPORT_PROJECTION_SCHEMA,
+      final_decision: finalDecision,
+      terminal_reason: terminalReason,
+      context_provider: contextProvider,
+      backend,
+      model,
+      recipe_id: "",
+      recipe_name: "General assistant loop",
+      step_count: stepCount,
+      started_at: startedAt,
+      completed_at: completedAt,
+      created_at: createdAt,
+    };
+  } catch {
+    return quarantinedLoopRun(runId);
+  }
 }
 
 function sanitizeRecipe(rawRecipe) {
@@ -447,6 +866,19 @@ function bumpThreadRevision(thread) {
   return thread.revision;
 }
 
+function threadMutationInProgress(threadId) {
+  return (
+    state.deletingThreadTokens.has(threadId) ||
+    state.clearingThreadTokens.has(threadId) ||
+    state.uploadThreadTokens.has(threadId) ||
+    state.runningQuery?.threadId === threadId
+  );
+}
+
+function ownsThreadOperation(tokens, threadId, token) {
+  return tokens.get(threadId) === token;
+}
+
 function sanitizeThread(rawThread) {
   const rawId = String(rawThread?.id || "");
   const id = SESSION_ID_PATTERN.test(rawId) ? rawId : "";
@@ -456,7 +888,9 @@ function sanitizeThread(rawThread) {
   const latest =
     rawThread?.latest && typeof rawThread.latest === "object" ? rawThread.latest : null;
   const loopRuns = Array.isArray(rawThread?.loop_runs)
-    ? rawThread.loop_runs.map(sanitizeLoopRun).filter((run) => run.run_id)
+    ? rawThread.loop_runs
+        .map((run) => sanitizeLoopRun(run, id))
+        .filter((run) => run.run_id)
     : [];
   const rawLoopRunCount = Number(rawThread?.loop_run_count ?? rawThread?.loopRunCount);
   const rawMemoryCount = Number(rawThread?.memory_count ?? rawThread?.memoryCount);
@@ -575,14 +1009,49 @@ function upsertThread(thread, { moveToTop = false } = {}) {
       ).slice(0, MAX_THREADS);
 }
 
-async function loadThreadDetail(threadId) {
+async function fetchThreadDetail(threadId) {
   const existingThread = threadById(threadId);
   const detail = sanitizeThread(
     await requestJson(`/api/threads/${encodeURIComponent(threadId)}`),
   );
-  const merged = preserveLocalInFlightThreadState(detail, existingThread);
+  if (detail.id !== threadId) {
+    throw new Error("Thread detail identity mismatch.");
+  }
+  return preserveLocalInFlightThreadState(detail, existingThread);
+}
+
+async function loadThreadDetail(threadId) {
+  const merged = await fetchThreadDetail(threadId);
   upsertThread(merged);
   return merged;
+}
+
+async function reconcileThreadDetail({
+  threadId,
+  expectedRevision,
+  tokens,
+  token,
+}) {
+  const current = threadById(threadId);
+  if (
+    !ownsThreadOperation(tokens, threadId, token) ||
+    !current ||
+    normalizedRevision(current.revision) !== expectedRevision
+  ) {
+    return false;
+  }
+  const detail = await fetchThreadDetail(threadId);
+  const latest = threadById(threadId);
+  if (
+    !ownsThreadOperation(tokens, threadId, token) ||
+    !latest ||
+    normalizedRevision(latest.revision) !== expectedRevision
+  ) {
+    return false;
+  }
+  detail.revision = expectedRevision + 1;
+  upsertThread(detail);
+  return true;
 }
 
 async function loadThreads() {
@@ -603,6 +1072,7 @@ async function loadThreads() {
   }
 
   const activeId = loadActiveThreadId();
+  state.threadSwitchRequestId += 1;
   state.activeThreadId = state.threads.some((thread) => thread.id === activeId)
     ? activeId
     : state.threads[0].id;
@@ -626,6 +1096,7 @@ function activeThread() {
       updatedAt: "",
       messageCount: 0,
     };
+    state.threadSwitchRequestId += 1;
     state.activeThreadId = thread.id;
     persistActiveThreadId();
   }
@@ -650,15 +1121,22 @@ function titleFromMessage(message) {
 
 function renderThreads() {
   elements.threadList.replaceChildren();
+  const activeThreadMutating =
+    !state.activeThreadId || threadMutationInProgress(state.activeThreadId);
   elements.deleteThreadButton.disabled =
     !state.threads.length ||
-    !state.activeThreadId ||
-    state.deletingThreadIds.has(state.activeThreadId);
+    activeThreadMutating;
+  elements.clearButton.disabled = activeThreadMutating;
+  elements.uploadButton.disabled = activeThreadMutating;
   for (const thread of state.threads) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "thread-button";
     button.dataset.active = String(thread.id === state.activeThreadId);
+    button.disabled =
+      state.deletingThreadTokens.has(thread.id) ||
+      state.clearingThreadTokens.has(thread.id) ||
+      state.uploadThreadTokens.has(thread.id);
     button.addEventListener("click", () =>
       switchThread(thread.id).catch((error) => {
         elements.uploadStatus.textContent = error.message;
@@ -694,10 +1172,22 @@ function memoryCountLabel(count) {
 }
 
 function runMemoryLabel(summary) {
-  const data = summary && typeof summary === "object" ? summary : {};
-  const recentCount = nonNegativeInteger(data.conversation_context_count);
-  const semanticCount = nonNegativeInteger(data.semantic_memory_count);
-  const semanticStatus = String(data.semantic_memory_status || "not_requested");
+  if (!summary || typeof summary !== "object" || !Object.keys(summary).length) {
+    return "no completed run yet";
+  }
+  const data = summary;
+  if (
+    !Number.isSafeInteger(data.conversation_context_count) ||
+    data.conversation_context_count < 0 ||
+    !Number.isSafeInteger(data.semantic_memory_count) ||
+    data.semantic_memory_count < 0 ||
+    typeof data.semantic_memory_status !== "string"
+  ) {
+    return "last run memory use unknown";
+  }
+  const recentCount = data.conversation_context_count;
+  const semanticCount = data.semantic_memory_count;
+  const semanticStatus = data.semantic_memory_status;
   const parts = [];
   if (recentCount) {
     parts.push(`${recentCount} recent ${plural(recentCount, "turn")}`);
@@ -744,15 +1234,38 @@ function renderMemoryStatus(payload) {
 }
 
 async function switchThread(threadId) {
-  if (!threadById(threadId)) {
+  if (!threadById(threadId) || threadId === state.activeThreadId) {
     return;
   }
+  const sourceThreadId = state.activeThreadId;
+  const requestId = state.threadSwitchRequestId + 1;
+  state.threadSwitchRequestId = requestId;
+  let detail;
+  try {
+    detail = await fetchThreadDetail(threadId);
+  } catch (error) {
+    if (
+      state.threadSwitchRequestId === requestId &&
+      state.activeThreadId === sourceThreadId
+    ) {
+      throw error;
+    }
+    return;
+  }
+  if (
+    state.threadSwitchRequestId !== requestId ||
+    state.activeThreadId !== sourceThreadId ||
+    !threadById(threadId) ||
+    state.deletingThreadTokens.has(threadId) ||
+    state.clearingThreadTokens.has(threadId) ||
+    state.uploadThreadTokens.has(threadId)
+  ) {
+    return;
+  }
+  upsertThread(detail);
   state.activeThreadId = threadId;
+  resetRunInspection();
   persistActiveThreadId();
-  await loadThreadDetail(threadId);
-  if (state.activeThreadId !== threadId) {
-    return;
-  }
   renderThreads();
   renderActiveThreadTitle();
   renderMessages();
@@ -774,7 +1287,9 @@ async function startNewThread() {
     }),
   );
   upsertThread(thread, { moveToTop: true });
+  state.threadSwitchRequestId += 1;
   state.activeThreadId = thread.id;
+  resetRunInspection();
   persistActiveThreadId();
   renderThreads();
   renderActiveThreadTitle();
@@ -790,10 +1305,7 @@ async function startNewThread() {
 async function deleteActiveThread() {
   const thread = activeThread();
   const threadId = thread.id;
-  if (!threadId) {
-    return;
-  }
-  if (state.deletingThreadIds.has(threadId)) {
+  if (!threadId || threadMutationInProgress(threadId)) {
     return;
   }
   const title = thread.title || DEFAULT_THREAD_TITLE;
@@ -806,58 +1318,117 @@ async function deleteActiveThread() {
     return;
   }
 
-  state.deletingThreadIds.add(threadId);
+  const deleteRevision = normalizedRevision(thread.revision);
+  const operationToken = state.threadOperationRequestId + 1;
+  state.threadOperationRequestId = operationToken;
+  state.deletingThreadTokens.set(threadId, operationToken);
+  resetRunInspection();
   setBusy(elements.deleteThreadButton, true, "Delete");
   if (state.activeThreadId === threadId) {
     setQueryControlsBusy(true);
   }
+  renderThreads();
   try {
-    await requestJson(`/api/threads/${encodeURIComponent(threadId)}`, {
-      method: "DELETE",
-    });
-    state.threads = state.threads.filter((item) => item.id !== threadId);
-    if (state.runningQuery?.threadId === threadId) {
-      stopQueryProgress(state.runningQuery.pendingId);
-      if (!state.deletingThreadIds.has(state.activeThreadId)) {
-        setQueryControlsBusy(false);
+    try {
+      await requestJson(`/api/threads/${encodeURIComponent(threadId)}`, {
+        method: "DELETE",
+      });
+    } catch (error) {
+      try {
+        await reconcileThreadDetail({
+          threadId,
+          expectedRevision: deleteRevision,
+          tokens: state.deletingThreadTokens,
+          token: operationToken,
+        });
+      } catch {
+        // The delete did not mutate local state, so the existing snapshot is safer.
       }
+      if (
+        ownsThreadOperation(
+          state.deletingThreadTokens,
+          threadId,
+          operationToken,
+        ) &&
+        state.activeThreadId === threadId
+      ) {
+        renderActiveThreadTitle();
+        renderMessages();
+        renderRuns(activeThread().loopRuns);
+        renderLoopPayload(activeThread().latest || emptyLoopPayload());
+        elements.uploadStatus.textContent = error.message;
+      }
+      return;
     }
+
+    if (
+      !ownsThreadOperation(
+        state.deletingThreadTokens,
+        threadId,
+        operationToken,
+      )
+    ) {
+      return;
+    }
+    state.threads = state.threads.filter((item) => item.id !== threadId);
     if (state.activeThreadId === threadId) {
+      state.threadSwitchRequestId += 1;
       state.activeThreadId = state.threads[0]?.id || null;
     }
-    if (!state.threads.length) {
-      await loadThreads();
-    } else if (
-      state.activeThreadId &&
-      !state.deletingThreadIds.has(state.activeThreadId)
-    ) {
-      await loadThreadDetail(state.activeThreadId);
+    if (state.activeThreadId) {
       persistActiveThreadId();
     }
+    resetRunInspection();
     renderThreads();
     renderActiveThreadTitle();
     renderMessages();
     renderRuns(activeThread().loopRuns);
     renderLoopPayload(activeThread().latest || emptyLoopPayload());
-    await refreshStatus().catch((error) => {
-      elements.uploadStatus.textContent = error.message;
-    });
-    elements.uploadStatus.textContent = `Deleted thread "${title}".`;
-  } catch (error) {
-    await loadThreadDetail(threadId).catch(() => {});
-    if (state.activeThreadId === threadId) {
+
+    let followupError = null;
+    try {
+      if (!state.threads.length) {
+        await loadThreads();
+      } else if (
+        state.activeThreadId &&
+        !state.deletingThreadTokens.has(state.activeThreadId) &&
+        !state.clearingThreadTokens.has(state.activeThreadId) &&
+        !state.uploadThreadTokens.has(state.activeThreadId)
+      ) {
+        await loadThreadDetail(state.activeThreadId);
+      }
+      if (state.activeThreadId) {
+        persistActiveThreadId();
+      }
+      resetRunInspection();
+      renderThreads();
       renderActiveThreadTitle();
       renderMessages();
       renderRuns(activeThread().loopRuns);
       renderLoopPayload(activeThread().latest || emptyLoopPayload());
+      await refreshStatus();
+    } catch (error) {
+      followupError = error;
     }
-    elements.uploadStatus.textContent = error.message;
+    elements.uploadStatus.textContent = followupError
+      ? `Deleted thread "${title}", but could not refresh the replacement: ${followupError.message}`
+      : `Deleted thread "${title}".`;
   } finally {
-    state.deletingThreadIds.delete(threadId);
+    if (
+      ownsThreadOperation(
+        state.deletingThreadTokens,
+        threadId,
+        operationToken,
+      )
+    ) {
+      state.deletingThreadTokens.delete(threadId);
+    }
     setBusy(elements.deleteThreadButton, false, "Delete");
     if (
       !state.runningQuery &&
-      !state.deletingThreadIds.has(state.activeThreadId)
+      !state.deletingThreadTokens.has(state.activeThreadId) &&
+      !state.clearingThreadTokens.has(state.activeThreadId) &&
+      !state.uploadThreadTokens.has(state.activeThreadId)
     ) {
       setQueryControlsBusy(false);
     }
@@ -890,8 +1461,15 @@ function renderRuntimeStatus(status, { uploadMessage = "" } = {}) {
   elements.uploadStatus.textContent = uploadMessage || sessionFileMessage(status);
 }
 
-function uploadStillMatchesActiveThread(threadId) {
-  return state.activeThreadId === threadId && !state.deletingThreadIds.has(threadId);
+function uploadStillMatchesActiveThread(threadId, operationToken) {
+  return (
+    state.activeThreadId === threadId &&
+    ownsThreadOperation(
+      state.uploadThreadTokens,
+      threadId,
+      operationToken,
+    )
+  );
 }
 
 function renderMessages() {
@@ -1219,6 +1797,789 @@ function renderTimeline(timeline) {
   }
 }
 
+function loopPhaseLabel(phase) {
+  const labels = {
+    input: "Input",
+    context_select: "Context",
+    retrieve: "Retrieve",
+    draft: "Draft",
+    format_check: "Format",
+    mechanical_check: "Check",
+    verify: "Verify",
+    retry: "Retry",
+    refuse: "Refuse",
+    final: "Final",
+    error: "Error",
+  };
+  const phaseKey = String(phase || "step");
+  return labels[phaseKey] || phaseKey.replaceAll("_", " ").replace(/\b\w/g, (value) =>
+    value.toUpperCase(),
+  );
+}
+
+function malformedPublicRunDetail() {
+  throw new Error("Stored public run detail is unavailable or malformed.");
+}
+
+function exactPublicObject(value, allowedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    malformedPublicRunDetail();
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.length !== allowedKeys.length ||
+    keys.some((key) => !allowedKeys.includes(key))
+  ) {
+    malformedPublicRunDetail();
+  }
+  return value;
+}
+
+function allowedPublicObject(value, allowedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    malformedPublicRunDetail();
+  }
+  if (Object.keys(value).some((key) => !allowedKeys.includes(key))) {
+    malformedPublicRunDetail();
+  }
+  return value;
+}
+
+function publicString(value, { nullable = false, category = false } = {}) {
+  if (nullable && value === null) {
+    return null;
+  }
+  if (
+    typeof value !== "string" ||
+    (category && !PUBLIC_CATEGORY_PATTERN.test(value))
+  ) {
+    malformedPublicRunDetail();
+  }
+  return value;
+}
+
+function publicDisplayLabel(value, { nullable = false } = {}) {
+  const label = publicString(value, { nullable });
+  if (label === null) {
+    return null;
+  }
+  const codePoints = Array.from(label);
+  if (
+    !codePoints.length ||
+    codePoints.every((character) =>
+      publicDisplayCodePointIsBlank(character.codePointAt(0)),
+    ) ||
+    codePoints.length > 512 ||
+    label.includes("://") ||
+    codePoints.some((character) =>
+      publicDisplayCodePointIsControl(character.codePointAt(0)),
+    )
+  ) {
+    malformedPublicRunDetail();
+  }
+  return label;
+}
+
+function publicDisplayCodePointIsBlank(codePoint) {
+  return (
+    PUBLIC_DISPLAY_BLANK_CODE_POINTS.has(codePoint) ||
+    (0x0080 <= codePoint && codePoint <= 0x009f) ||
+    PUBLIC_DISPLAY_FORMAT_CODE_POINT_RANGES.some(
+      ([start, end]) => start <= codePoint && codePoint <= end,
+    ) ||
+    PUBLIC_DISPLAY_MARK_CODE_POINT_RANGES.some(
+      ([start, end]) => start <= codePoint && codePoint <= end,
+    )
+  );
+}
+
+function publicDisplayCodePointIsControl(codePoint) {
+  return codePoint < 32 || (0x007f <= codePoint && codePoint <= 0x009f);
+}
+
+function publicBoolean(value) {
+  if (typeof value !== "boolean") {
+    malformedPublicRunDetail();
+  }
+  return value;
+}
+
+function publicInteger(value, { minimum = 0, nullable = false } = {}) {
+  if (nullable && value === null) {
+    return null;
+  }
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    malformedPublicRunDetail();
+  }
+  return value;
+}
+
+function publicTimestamp(value, { nullable = false } = {}) {
+  const timestamp = publicString(value, { nullable });
+  if (timestamp === null) {
+    return null;
+  }
+  if (!timestamp.endsWith("Z") || Number.isNaN(Date.parse(timestamp))) {
+    malformedPublicRunDetail();
+  }
+  return timestamp;
+}
+
+function publicEnum(value, allowed, { nullable = false } = {}) {
+  if (nullable && value === null) {
+    return null;
+  }
+  if (typeof value !== "string" || !allowed.has(value)) {
+    malformedPublicRunDetail();
+  }
+  return value;
+}
+
+function normalizePublicPolicy(value) {
+  const policy = exactPublicObject(value, PUBLIC_POLICY_KEYS);
+  return {
+    max_retries: publicInteger(policy.max_retries),
+    require_citations: publicBoolean(policy.require_citations),
+    require_verifier_for_supported: publicBoolean(
+      policy.require_verifier_for_supported,
+    ),
+    allow_mock_supported: publicBoolean(policy.allow_mock_supported),
+    allow_tool_calls: publicBoolean(policy.allow_tool_calls),
+    require_human_review_for_tools: publicBoolean(
+      policy.require_human_review_for_tools,
+    ),
+  };
+}
+
+function normalizePublicVerification(value) {
+  if (value === null) {
+    return null;
+  }
+  const verification = exactPublicObject(value, PUBLIC_VERIFICATION_KEYS);
+  return {
+    outcome: publicEnum(
+      verification.outcome,
+      PUBLIC_VERIFICATION_OUTCOMES,
+    ),
+    verifier_backend: publicEnum(verification.verifier_backend, PUBLIC_BACKENDS, {
+      nullable: true,
+    }),
+    verifier_model_label: publicDisplayLabel(verification.verifier_model_label, {
+      nullable: true,
+    }),
+    same_model_as_drafter:
+      verification.same_model_as_drafter === null
+        ? null
+        : publicBoolean(verification.same_model_as_drafter),
+  };
+}
+
+function normalizePublicStep(value) {
+  const step = exactPublicObject(value, PUBLIC_STEP_KEYS);
+  const stepId = publicString(step.step_id);
+  if (!SESSION_ID_PATTERN.test(stepId)) {
+    malformedPublicRunDetail();
+  }
+  return {
+    step_id: stepId,
+    phase: publicEnum(step.phase, PUBLIC_PHASES),
+    decision: publicEnum(step.decision, PUBLIC_DECISIONS),
+    started_at: publicTimestamp(step.started_at),
+    ended_at: publicTimestamp(step.ended_at, { nullable: true }),
+    duration_ms: publicInteger(step.duration_ms, { nullable: true }),
+    backend: publicEnum(step.backend, PUBLIC_BACKENDS, { nullable: true }),
+    model_label: publicDisplayLabel(step.model_label, { nullable: true }),
+    retry_count: publicInteger(step.retry_count),
+    error_present: publicBoolean(step.error_present),
+    verification: normalizePublicVerification(step.verification),
+    human_review_required: publicBoolean(step.human_review_required),
+  };
+}
+
+function normalizePublicEvidence(value) {
+  const evidence = exactPublicObject(value, PUBLIC_EVIDENCE_KEYS);
+  const locator = exactPublicObject(
+    evidence.locator,
+    PUBLIC_EVIDENCE_LOCATOR_KEYS,
+  );
+  const evidenceId = publicString(evidence.evidence_id);
+  if (!PUBLIC_EVIDENCE_ID_PATTERN.test(evidenceId)) {
+    malformedPublicRunDetail();
+  }
+  return {
+    evidence_id: evidenceId,
+    citation_id: publicInteger(evidence.citation_id, { minimum: 1 }),
+    provider: publicEnum(evidence.provider, PUBLIC_EVIDENCE_PROVIDERS),
+    locator: {
+      page: publicInteger(locator.page, { nullable: true }),
+      chunk_index: publicInteger(locator.chunk_index, { nullable: true }),
+    },
+  };
+}
+
+function validatePublicRedactionContract({
+  redactionApplied,
+  finalDecision,
+  terminalReason,
+  finalAnswer,
+  backend,
+  modelLabel,
+  contextProvider,
+  steps,
+  evidence,
+}) {
+  const allowedReasons = PUBLIC_FINAL_REASON_CONTRACT.get(finalDecision);
+  if (!allowedReasons || !allowedReasons.has(terminalReason)) {
+    malformedPublicRunDetail();
+  }
+
+  const terminalDecision = PUBLIC_TERMINAL_DECISIONS.has(finalDecision);
+  if (redactionApplied !== terminalDecision) {
+    malformedPublicRunDetail();
+  }
+
+  for (const step of steps) {
+    const expectedFinalDecisions = new Set();
+    if (step.phase === "refuse" || step.decision === "refuse") {
+      expectedFinalDecisions.add("refuse");
+    }
+    if (step.decision === "block") {
+      expectedFinalDecisions.add("block");
+    }
+    if (step.decision === "requires_review" || step.human_review_required) {
+      expectedFinalDecisions.add("requires_review");
+    }
+    if (
+      expectedFinalDecisions.size > 1 ||
+      [...expectedFinalDecisions].some(
+        (expectedFinalDecision) => finalDecision !== expectedFinalDecision,
+      )
+    ) {
+      malformedPublicRunDetail();
+    }
+  }
+
+  if (
+    (contextProvider === "none" && evidence.length > 0) ||
+    evidence.some((item) => item.provider !== contextProvider)
+  ) {
+    malformedPublicRunDetail();
+  }
+
+  if (redactionApplied) {
+    if (
+      finalAnswer !== null ||
+      evidence.length > 0 ||
+      backend !== null ||
+      modelLabel !== null
+    ) {
+      malformedPublicRunDetail();
+    }
+    for (const step of steps) {
+      const verification = step.verification;
+      if (
+        step.backend !== null ||
+        step.model_label !== null ||
+        (verification !== null &&
+          (verification.verifier_backend !== null ||
+            verification.verifier_model_label !== null ||
+            verification.same_model_as_drafter !== null))
+      ) {
+        malformedPublicRunDetail();
+      }
+    }
+    return;
+  }
+
+  if (
+    finalAnswer !== null &&
+    !["final", "supported", "not_verified"].includes(finalDecision)
+  ) {
+    malformedPublicRunDetail();
+  }
+}
+
+function normalizePublicReport(value, expectedThreadId, expectedRunId) {
+  const report = exactPublicObject(value, PUBLIC_REPORT_KEYS);
+  const redaction = exactPublicObject(
+    report.public_redaction,
+    PUBLIC_REDACTION_KEYS,
+  );
+  const run = exactPublicObject(report.run, PUBLIC_RUN_KEYS);
+  const runId = publicString(run.run_id);
+  const sessionId = publicString(run.session_id);
+  if (
+    report.schema_version !== PUBLIC_REPORT_SOURCE_SCHEMA ||
+    report.projection_schema_version !== PUBLIC_REPORT_PROJECTION_SCHEMA ||
+    report.public !== true ||
+    runId !== expectedRunId ||
+    sessionId !== expectedThreadId ||
+    !SESSION_ID_PATTERN.test(runId) ||
+    !SESSION_ID_PATTERN.test(sessionId)
+  ) {
+    malformedPublicRunDetail();
+  }
+  const redactionApplied = publicBoolean(redaction.applied);
+  const redactionReason = publicString(redaction.reason, { nullable: true });
+  if (
+    (redactionApplied && redactionReason !== PUBLIC_REDACTION_REASON) ||
+    (!redactionApplied && redactionReason !== null)
+  ) {
+    malformedPublicRunDetail();
+  }
+  if (!Array.isArray(run.steps) || !Array.isArray(run.evidence)) {
+    malformedPublicRunDetail();
+  }
+  const contextProvider = publicEnum(
+    run.context_provider,
+    PUBLIC_CONTEXT_PROVIDERS,
+  );
+  const backend = publicEnum(run.backend, PUBLIC_BACKENDS, { nullable: true });
+  const modelLabel = publicDisplayLabel(run.model_label, { nullable: true });
+  const finalDecision = publicEnum(
+    run.final_decision,
+    PUBLIC_FINAL_DECISIONS,
+    { nullable: true },
+  );
+  const terminalReason = publicEnum(
+    run.terminal_reason,
+    PUBLIC_TERMINAL_REASONS,
+    { nullable: true },
+  );
+  const finalAnswer = publicString(run.final_answer, { nullable: true });
+  const conversationContextCount = publicInteger(
+    run.conversation_context_count,
+    { nullable: true },
+  );
+  const semanticMemoryCount = publicInteger(run.semantic_memory_count, {
+    nullable: true,
+  });
+  const semanticMemoryStatus = publicEnum(
+    run.semantic_memory_status,
+    PUBLIC_MEMORY_STATUSES,
+    { nullable: true },
+  );
+  const memoryProvenance = [
+    conversationContextCount,
+    semanticMemoryCount,
+    semanticMemoryStatus,
+  ];
+  const allMemoryProvenanceMissing = memoryProvenance.every(
+    (item) => item === null,
+  );
+  if (
+    (!allMemoryProvenanceMissing && memoryProvenance.includes(null)) ||
+    (!allMemoryProvenanceMissing &&
+      (semanticMemoryStatus === "retrieved") !== (semanticMemoryCount > 0))
+  ) {
+    malformedPublicRunDetail();
+  }
+  const steps = run.steps.map(normalizePublicStep);
+  const evidence = run.evidence.map(normalizePublicEvidence);
+  if (
+    new Set(steps.map((step) => step.step_id)).size !== steps.length ||
+    new Set(evidence.map((item) => item.evidence_id)).size !== evidence.length ||
+    new Set(evidence.map((item) => item.citation_id)).size !== evidence.length
+  ) {
+    malformedPublicRunDetail();
+  }
+  validatePublicRedactionContract({
+    redactionApplied,
+    finalDecision,
+    terminalReason,
+    finalAnswer,
+    backend,
+    modelLabel,
+    contextProvider,
+    steps,
+    evidence,
+  });
+  return {
+    schema_version: PUBLIC_REPORT_SOURCE_SCHEMA,
+    projection_schema_version: PUBLIC_REPORT_PROJECTION_SCHEMA,
+    public: true,
+    public_redaction: {
+      applied: redactionApplied,
+      reason: redactionReason,
+    },
+    run: {
+      run_id: runId,
+      session_id: sessionId,
+      context_provider: contextProvider,
+      conversation_context_count: conversationContextCount,
+      semantic_memory_count: semanticMemoryCount,
+      semantic_memory_status: semanticMemoryStatus,
+      backend,
+      model_label: modelLabel,
+      policy: normalizePublicPolicy(run.policy),
+      started_at: publicTimestamp(run.started_at),
+      completed_at: publicTimestamp(run.completed_at, { nullable: true }),
+      steps,
+      evidence,
+      final_decision: finalDecision,
+      terminal_reason: terminalReason,
+      final_answer: finalAnswer,
+      error_present: publicBoolean(run.error_present),
+    },
+  };
+}
+
+function publicStepSignals(step) {
+  const verification = objectRecord(step.verification);
+  const parts = [];
+  if (verification.outcome) {
+    parts.push(`verifier: ${verification.outcome}`);
+  }
+  if (nonNegativeInteger(step.retry_count)) {
+    parts.push(`retry #${nonNegativeInteger(step.retry_count)}`);
+  }
+  if (step.error_present) {
+    parts.push("error recorded");
+  }
+  if (step.human_review_required) {
+    parts.push("human review required");
+  }
+  return safeText(parts.join("; "), "-", 600);
+}
+
+function publicEvidenceCitation(evidence) {
+  const data = objectRecord(evidence);
+  const locator = objectRecord(data.locator);
+  return {
+    evidence_id: safeText(data.evidence_id, "", 160) || null,
+    citation_id: data.citation_id ?? null,
+    provider: safeText(data.provider, "unknown", 80),
+    locator: {
+      page: locator.page ?? null,
+      chunk_index: locator.chunk_index ?? null,
+    },
+  };
+}
+
+function publicSelfCheck(selfCheck) {
+  const data = objectRecord(selfCheck);
+  if (!Object.keys(data).length) {
+    return null;
+  }
+  return {
+    outcome: data.outcome || null,
+    reasons: Array.isArray(data.reasons)
+      ? data.reasons.map((reason) => safeText(reason, "", 400)).filter(Boolean)
+      : [],
+    retry_attempted: Boolean(data.retry_attempted),
+  };
+}
+
+function publicCheckOutcome(step) {
+  if (!step) {
+    return null;
+  }
+  if (step.error_present || step.decision === "error") {
+    return "failed";
+  }
+  if (step.decision === "retry") {
+    return "retry";
+  }
+  return "passed";
+}
+
+function historicalModelThinking(redacted) {
+  return {
+    available: false,
+    redacted: Boolean(redacted),
+    label: "Model Thinking (unverified)",
+    content: null,
+    note: "Model thinking is not included in public durable-run records.",
+  };
+}
+
+function historicalLoopPayload(detail, expectedThreadId, expectedRunId) {
+  const payload = allowedPublicObject(detail, PUBLIC_DETAIL_KEYS);
+  const detailRunId = payload.run_id;
+  const detailThreadId = payload.thread_id;
+  if (
+    payload.public !== true ||
+    typeof detailRunId !== "string" ||
+    typeof detailThreadId !== "string" ||
+    detailThreadId !== expectedThreadId ||
+    detailRunId !== expectedRunId
+  ) {
+    malformedPublicRunDetail();
+  }
+  const report = normalizePublicReport(
+    payload.report,
+    expectedThreadId,
+    expectedRunId,
+  );
+  const run = report.run;
+  const runId = run.run_id;
+  const steps = run.steps;
+  const evidence = run.evidence;
+  const formatSteps = steps.filter((step) => step.phase === "format_check");
+  const mechanicalSteps = steps.filter(
+    (step) => step.phase === "mechanical_check",
+  );
+  const verifySteps = steps.filter((step) => step.phase === "verify");
+  const verifyStep = verifySteps.at(-1);
+  const verification = objectRecord(verifyStep?.verification);
+  const publicRedaction = objectRecord(report.public_redaction);
+  const finalDecision = run.final_decision || null;
+  const ordinaryRefusal =
+    publicRedaction.applied === true &&
+    finalDecision === "refuse" &&
+    ["verification_failed", "retry_budget_exhausted"].includes(
+      run.terminal_reason,
+    );
+  const publicError = publicRedaction.applied === true
+    ? ordinaryRefusal
+      ? null
+      : PUBLIC_REDACTION_REASON
+    : run.error_present === true
+      ? "loop_error"
+      : null;
+  const thinkingRedactionApplied = [
+    "block",
+    "error",
+    "refuse",
+    "requires_review",
+  ].includes(finalDecision) || publicRedaction.applied === true;
+  const citations = evidence.map(publicEvidenceCitation);
+  const citationStatus = citations.length
+    ? "available"
+    : publicRedaction.applied === true
+      ? "redacted"
+      : "unavailable";
+  const citationDetails =
+    citationStatus === "redacted"
+      ? "Citation details redacted for this terminal run."
+      : citationStatus === "available"
+        ? "Citation identities and locators are available from the stored public report."
+        : "No public citation identities are available for this run.";
+  const timeline = {
+    rows: steps.map((step, index) => ({
+      index: index + 1,
+      phase: loopPhaseLabel(step.phase),
+      phase_key: String(step.phase || ""),
+      decision: String(step.decision || "continue"),
+      step: safeText(step.name, loopPhaseLabel(step.phase), 160),
+      signals: publicStepSignals(step),
+    })),
+    final_decision: finalDecision,
+    terminal_reason: run.terminal_reason || null,
+    last_error: publicError,
+  };
+  const summary = {
+    source: "durable_public_report",
+    public: true,
+    schema_version: report.schema_version || null,
+    projection_schema_version: report.projection_schema_version,
+    run_id: runId,
+    started_at: run.started_at || null,
+    completed_at: run.completed_at || null,
+    context_provider: run.context_provider || null,
+    backend: run.backend || null,
+    model: run.model_label || null,
+    conversation_context_count: run.conversation_context_count,
+    semantic_memory_count: run.semantic_memory_count,
+    semantic_memory_status: run.semantic_memory_status,
+    recipe_id: null,
+    recipe_name: null,
+    step_count: steps.length,
+    draft_attempt_count: steps.filter((step) => step.phase === "draft").length,
+    format_check: publicCheckOutcome(formatSteps.at(-1)),
+    mechanical_check: publicCheckOutcome(mechanicalSteps.at(-1)),
+    verifier: verifyStep && Object.keys(verification).length
+      ? {
+          decision: verifyStep.decision || null,
+          outcome: verification.outcome || null,
+          reasons: [],
+        }
+      : null,
+    retry_attempted: steps.some((step) => step.phase === "retry"),
+    refused:
+      finalDecision === "refuse" || steps.some((step) => step.phase === "refuse"),
+    final_decision: finalDecision,
+    terminal_reason: run.terminal_reason || null,
+    last_error: publicError,
+    citation_details: citationDetails,
+    public_redaction: publicRedaction.applied
+      ? {
+          applied: true,
+          reason: publicRedaction.reason || null,
+        }
+      : { applied: false },
+  };
+  return {
+    payload: {
+      timeline,
+      summary,
+      trace: {
+        source: "durable_public_report",
+        public: true,
+        question: null,
+        answer: publicRedaction.applied === true
+          ? ordinaryRefusal
+            ? SELF_CHECK_REFUSAL_ANSWER
+            : PUBLIC_REDACTION_TEXT
+          : (run.final_answer ?? null),
+        document: null,
+        backend: run.backend ?? null,
+        model: run.model_label ?? null,
+        retrieved_chunk_count: citations.length,
+        citations,
+        citation_details: citationDetails,
+        self_check: verifyStep
+          ? publicSelfCheck({
+              ...verification,
+              retry_attempted: steps.some((step) => step.phase === "retry"),
+            })
+          : null,
+        model_thinking: historicalModelThinking(thinkingRedactionApplied),
+        loop_report: report,
+        terminal_reason: run.terminal_reason || null,
+        error: publicError,
+      },
+    },
+    citationStatus,
+  };
+}
+
+function resetRunInspection(message = "") {
+  state.runInspection = {
+    requestId: state.runInspection.requestId + 1,
+    threadId: state.activeThreadId,
+    runId: null,
+    pendingRunId: null,
+    status: "idle",
+    message,
+  };
+}
+
+function runInspectorMessage(durableRuns) {
+  const inspection = state.runInspection;
+  const inspectableRunCount = durableRuns.filter(
+    (run) => run.projection_status === "available",
+  ).length;
+  if (
+    inspection.threadId === state.activeThreadId &&
+    inspection.message
+  ) {
+    return inspection.message;
+  }
+  if (activeThread().latest) {
+    return inspectableRunCount
+      ? "Showing the latest run. Select a stored run to inspect its public record."
+      : durableRuns.length
+        ? "Showing the latest run. Stored runs are quarantined and cannot be inspected."
+        : "Showing the latest run. No stored public run is available to inspect.";
+  }
+  if (inspectableRunCount) {
+    return "Select a stored run to inspect its public record.";
+  }
+  if (durableRuns.length) {
+    return "Stored runs are quarantined and cannot be inspected.";
+  }
+  return "No public run record is available to inspect.";
+}
+
+function renderRunInspectorStatus(durableRuns) {
+  const status = document.createElement("p");
+  status.className = "run-inspector-status";
+  status.role = "status";
+  status.ariaLive = "polite";
+  status.dataset.state =
+    state.runInspection.threadId === state.activeThreadId
+      ? state.runInspection.status
+      : "idle";
+  status.textContent = runInspectorMessage(durableRuns);
+  elements.runList.append(status);
+}
+
+function restoreInspectedRunFocus() {
+  if (
+    state.runInspection.threadId !== state.activeThreadId ||
+    !state.runInspection.runId
+  ) {
+    return;
+  }
+  const selected = Array.from(elements.runList.children).find(
+    (item) =>
+      item.className === "run-row" && item.dataset.selected === "true",
+  );
+  selected?.focus({ preventScroll: true });
+}
+
+function runInspectionIsCurrent(requestId, threadId, runId) {
+  return (
+    state.activeThreadId === threadId &&
+    state.runInspection.requestId === requestId &&
+    state.runInspection.threadId === threadId &&
+    state.runInspection.pendingRunId === runId
+  );
+}
+
+async function inspectDurableRun(runId) {
+  const threadId = state.activeThreadId;
+  const selectedRun = activeThread().loopRuns.find(
+    (run) => run.run_id === runId,
+  );
+  if (
+    !SESSION_ID_PATTERN.test(String(threadId || "")) ||
+    selectedRun?.projection_status !== "available" ||
+    state.deletingThreadTokens.has(threadId) ||
+    state.clearingThreadTokens.has(threadId) ||
+    state.uploadThreadTokens.has(threadId) ||
+    state.runningQuery?.threadId === threadId
+  ) {
+    return;
+  }
+  const requestId = state.runInspection.requestId + 1;
+  state.runInspection = {
+    requestId,
+    threadId,
+    runId:
+      state.runInspection.threadId === threadId
+        ? state.runInspection.runId
+        : null,
+    pendingRunId: runId,
+    status: "loading",
+    message: `Loading stored public run ${runId}…`,
+  };
+  renderRuns(activeThread().loopRuns);
+  try {
+    const detail = await requestJson(
+      `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}`,
+    );
+    if (!runInspectionIsCurrent(requestId, threadId, runId)) {
+      return;
+    }
+    const historical = historicalLoopPayload(detail, threadId, runId);
+    state.runInspection.runId = runId;
+    state.runInspection.pendingRunId = null;
+    state.runInspection.status = "loaded";
+    state.runInspection.message =
+      historical.citationStatus === "available"
+        ? `Viewing stored public run ${runId}.`
+        : historical.citationStatus === "redacted"
+          ? `Viewing stored public run ${runId}. Citation details are terminal-redacted.`
+          : `Viewing stored public run ${runId}. No public citation identities are available.`;
+    renderRuns(activeThread().loopRuns);
+    renderLoopPayload(historical.payload);
+  } catch (error) {
+    if (!runInspectionIsCurrent(requestId, threadId, runId)) {
+      return;
+    }
+    state.runInspection.pendingRunId = null;
+    state.runInspection.status = "error";
+    state.runInspection.message = `Could not inspect ${runId}: ${safeText(
+      error.message,
+      "request failed",
+      240,
+    )}`;
+    renderRuns(activeThread().loopRuns);
+  }
+}
+
 function renderRuns(runs) {
   const durableRuns = Array.isArray(runs) ? runs : [];
   elements.runList.replaceChildren();
@@ -1228,27 +2589,68 @@ function renderRuns(runs) {
     empty.className = "empty-state";
     empty.textContent = "No durable loop runs stored for this thread yet.";
     elements.runList.append(empty);
+    renderRunInspectorStatus(durableRuns);
     return;
   }
 
   for (const run of durableRuns) {
-    const row = document.createElement("article");
+    const quarantined = run.projection_status === "quarantined";
+    const row = document.createElement("button");
+    row.type = "button";
     row.className = "run-row";
+    const isInspected =
+      !quarantined &&
+      state.runInspection.threadId === state.activeThreadId &&
+      state.runInspection.runId === run.run_id;
+    const isPending =
+      !quarantined &&
+      state.runInspection.threadId === state.activeThreadId &&
+      state.runInspection.pendingRunId === run.run_id;
+    row.dataset.selected = String(isInspected);
+    row.dataset.state = quarantined
+      ? "quarantined"
+      : isPending
+        ? "loading"
+        : isInspected
+          ? "loaded"
+          : "idle";
+    row.ariaPressed = String(isInspected);
+    row.ariaBusy = String(isPending);
+    row.disabled =
+      quarantined ||
+      state.deletingThreadTokens.has(state.activeThreadId) ||
+      state.clearingThreadTokens.has(state.activeThreadId) ||
+      state.uploadThreadTokens.has(state.activeThreadId) ||
+      state.runningQuery?.threadId === state.activeThreadId;
+    if (!quarantined) {
+      row.addEventListener("click", () => inspectDurableRun(run.run_id));
+    }
 
     const title = document.createElement("strong");
-    title.textContent = `${run.final_decision || "unknown"} · ${
-      run.recipe_name || "Loop recipe"
-    }`;
+    title.textContent = quarantined
+      ? "Quarantined · Stored loop run"
+      : `${run.final_decision || "unknown"} · ${
+          run.recipe_name || "Loop recipe"
+        }`;
 
     const meta = document.createElement("span");
-    const stepCount = Number.isSafeInteger(run.step_count) ? run.step_count : 0;
-    meta.textContent = `${stepCount} ${stepCount === 1 ? "step" : "steps"} · ${
-      run.context_provider || "none"
-    } · ${run.backend || "backend"} · ${run.run_id}`;
+    if (quarantined) {
+      const reasonLabel = LOOP_RUN_QUARANTINE_REASON_LABELS.get(
+        run.quarantine_reason,
+      ) || LOOP_RUN_QUARANTINE_REASON_LABELS.get(DEFAULT_QUARANTINE_REASON);
+      meta.textContent = `${reasonLabel} · ${run.run_id}`;
+    } else {
+      const stepCount = Number.isSafeInteger(run.step_count) ? run.step_count : 0;
+      meta.textContent = `${stepCount} ${stepCount === 1 ? "step" : "steps"} · ${
+        run.context_provider || "none"
+      } · ${run.backend || "backend"} · ${run.run_id}`;
+    }
 
     row.append(title, meta);
     elements.runList.append(row);
   }
+  renderRunInspectorStatus(durableRuns);
+  restoreInspectedRunFocus();
 }
 
 function renderModelThinking(thinking) {
@@ -1561,17 +2963,31 @@ async function importRecipe() {
 }
 
 async function refreshStatus() {
+  const requestThreadId = state.activeThreadId;
   const headers = {};
-  if (state.activeThreadId) {
-    headers["x-ai-loop-session-id"] = state.activeThreadId;
+  if (requestThreadId) {
+    headers["x-ai-loop-session-id"] = requestThreadId;
   }
-  const status = await requestJson("/api/status", { headers });
+  let status;
+  try {
+    status = await requestJson("/api/status", { headers });
+  } catch (error) {
+    if (state.activeThreadId === requestThreadId) {
+      throw error;
+    }
+    return false;
+  }
+  if (state.activeThreadId !== requestThreadId) {
+    return false;
+  }
   renderRuntimeStatus(status);
+  return true;
 }
 
 async function refreshStatusAfterStaleUpload() {
-  await refreshStatus();
-  elements.uploadStatus.textContent = "Active session changed; current file status refreshed.";
+  if (await refreshStatus()) {
+    elements.uploadStatus.textContent = "Active session changed; current file status refreshed.";
+  }
 }
 
 async function uploadDocument(event) {
@@ -1583,19 +2999,27 @@ async function uploadDocument(event) {
   }
 
   const uploadThreadId = activeThread().id || "default";
+  if (!uploadThreadId || threadMutationInProgress(uploadThreadId)) {
+    return;
+  }
+  const operationToken = state.threadOperationRequestId + 1;
+  state.threadOperationRequestId = operationToken;
+  state.uploadThreadTokens.set(uploadThreadId, operationToken);
   const formData = new FormData();
   formData.append("file", file);
   formData.append("text_encoding", elements.textEncoding?.value || DEFAULT_TEXT_ENCODING);
   formData.append("session_id", uploadThreadId);
 
   setBusy(elements.uploadButton, true, "Attach File");
+  setQueryControlsBusy(true);
+  renderThreads();
   elements.uploadStatus.textContent = "Attaching file to this session...";
   try {
     const result = await requestJson("/api/documents", {
       method: "POST",
       body: formData,
     });
-    if (uploadStillMatchesActiveThread(uploadThreadId)) {
+    if (uploadStillMatchesActiveThread(uploadThreadId, operationToken)) {
       renderRuntimeStatus(result.status, {
         uploadMessage: sessionFileMessage(result.status),
       });
@@ -1605,7 +3029,7 @@ async function uploadDocument(event) {
       });
     }
   } catch (error) {
-    if (uploadStillMatchesActiveThread(uploadThreadId)) {
+    if (uploadStillMatchesActiveThread(uploadThreadId, operationToken)) {
       elements.uploadStatus.textContent = error.message;
       await refreshStatus().catch(() => {});
     } else {
@@ -1614,7 +3038,22 @@ async function uploadDocument(event) {
       });
     }
   } finally {
-    setBusy(elements.uploadButton, false, "Attach File");
+    if (
+      ownsThreadOperation(
+        state.uploadThreadTokens,
+        uploadThreadId,
+        operationToken,
+      )
+    ) {
+      state.uploadThreadTokens.delete(uploadThreadId);
+    }
+    if (!state.uploadThreadTokens.size) {
+      setBusy(elements.uploadButton, false, "Attach File");
+    }
+    if (!state.runningQuery && !threadMutationInProgress(state.activeThreadId)) {
+      setQueryControlsBusy(false);
+    }
+    renderThreads();
   }
 }
 
@@ -1634,7 +3073,11 @@ async function runQuery(event) {
 
   const requestThread = activeThread();
   const requestThreadId = requestThread.id;
-  if (!requestThreadId || state.deletingThreadIds.has(requestThreadId)) {
+  if (
+    state.runningQuery ||
+    !requestThreadId ||
+    threadMutationInProgress(requestThreadId)
+  ) {
     return;
   }
   const baseMessageCount = nonNegativeInteger(requestThread.messageCount);
@@ -1660,14 +3103,15 @@ async function runQuery(event) {
   });
   requestThread.messages.push(pendingMessage);
   touchThread(requestThread);
+  setQueryControlsBusy(true);
+  startQueryProgress(requestThreadId, pendingMessage.pending_id);
   renderThreads();
   renderActiveThreadTitle();
   renderMessages();
+  resetRunInspection("Showing live run progress.");
+  renderRuns(requestThread.loopRuns);
   renderLoopPayload(runningLoopPayload(pendingMessage));
   elements.queryInput.value = "";
-
-  setQueryControlsBusy(true);
-  startQueryProgress(requestThreadId, pendingMessage.pending_id);
   try {
     const queryPayload = {
       message,
@@ -1687,7 +3131,8 @@ async function runQuery(event) {
     if (
       !targetThread ||
       normalizedRevision(targetThread.revision) !== requestRevision ||
-      state.deletingThreadIds.has(requestThreadId)
+      state.deletingThreadTokens.has(requestThreadId) ||
+      state.clearingThreadTokens.has(requestThreadId)
     ) {
       return;
     }
@@ -1703,7 +3148,10 @@ async function runQuery(event) {
       });
     }
     if (result.run?.run_id) {
-      const run = sanitizeLoopRun(result.run);
+      const run = sanitizeLoopRun(result.run, requestThreadId);
+      if (!run.run_id) {
+        throw new Error("Stored run summary is unavailable or malformed.");
+      }
       const priorRunCount = Number.isSafeInteger(targetThread.loopRunCount)
         ? targetThread.loopRunCount
         : Array.isArray(targetThread.loopRuns) ? targetThread.loopRuns.length : 0;
@@ -1726,6 +3174,7 @@ async function runQuery(event) {
     touchThread(targetThread);
     renderThreads();
     if (state.activeThreadId === requestThreadId) {
+      resetRunInspection();
       renderActiveThreadTitle();
       renderMessages();
       renderRuns(targetThread.loopRuns);
@@ -1736,7 +3185,8 @@ async function runQuery(event) {
     if (
       !targetThread ||
       normalizedRevision(targetThread.revision) !== requestRevision ||
-      state.deletingThreadIds.has(requestThreadId)
+      state.deletingThreadTokens.has(requestThreadId) ||
+      state.clearingThreadTokens.has(requestThreadId)
     ) {
       return;
     }
@@ -1745,6 +3195,8 @@ async function runQuery(event) {
     touchThread(targetThread);
     renderThreads();
     if (state.activeThreadId === requestThreadId) {
+      resetRunInspection("Showing the latest query error.");
+      renderRuns(targetThread.loopRuns);
       renderMessages();
       renderLoopPayload(queryErrorLoopPayload(error.message));
     }
@@ -1753,8 +3205,19 @@ async function runQuery(event) {
       state.runningQuery?.pendingId === pendingMessage.pending_id;
     stopQueryProgress(pendingMessage.pending_id);
     if (
+      state.activeThreadId === requestThreadId &&
+      !state.deletingThreadTokens.has(requestThreadId) &&
+      !state.clearingThreadTokens.has(requestThreadId) &&
+      !state.uploadThreadTokens.has(requestThreadId)
+    ) {
+      renderRuns(activeThread().loopRuns);
+    }
+    renderThreads();
+    if (
       (ownsRunningState || !state.runningQuery) &&
-      !state.deletingThreadIds.has(state.activeThreadId)
+      !state.deletingThreadTokens.has(state.activeThreadId) &&
+      !state.clearingThreadTokens.has(state.activeThreadId) &&
+      !state.uploadThreadTokens.has(state.activeThreadId)
     ) {
       setQueryControlsBusy(false);
     }
@@ -1764,17 +3227,26 @@ async function runQuery(event) {
 async function clearChat() {
   const thread = activeThread();
   const threadId = thread.id;
+  if (!threadId || threadMutationInProgress(threadId)) {
+    return;
+  }
+  const rollbackSnapshot = {
+    ...thread,
+    messages: thread.messages.map((message) => ({ ...message })),
+    loopRuns: thread.loopRuns.map((run) => ({ ...run })),
+  };
+  const operationToken = state.threadOperationRequestId + 1;
+  state.threadOperationRequestId = operationToken;
+  state.clearingThreadTokens.set(threadId, operationToken);
   const clearRevision = bumpThreadRevision(thread);
   thread.messages = [];
   thread.loopRuns = [];
   thread.loopRunCount = 0;
   thread.memoryCount = 0;
   thread.latest = null;
+  resetRunInspection();
   touchThread(thread);
-  if (state.runningQuery?.threadId === threadId) {
-    stopQueryProgress(state.runningQuery.pendingId);
-    setQueryControlsBusy(false);
-  }
+  setQueryControlsBusy(true);
   renderThreads();
   renderActiveThreadTitle();
   renderMessages();
@@ -1787,7 +3259,15 @@ async function clearChat() {
       body: JSON.stringify({ session_id: threadId }),
     });
     const targetThread = threadById(threadId);
-    if (!targetThread || normalizedRevision(targetThread.revision) !== clearRevision) {
+    if (
+      !ownsThreadOperation(
+        state.clearingThreadTokens,
+        threadId,
+        operationToken,
+      ) ||
+      !targetThread ||
+      normalizedRevision(targetThread.revision) !== clearRevision
+    ) {
       return;
     }
     targetThread.latest = payload;
@@ -1797,7 +3277,80 @@ async function clearChat() {
       renderLoopPayload(payload);
     }
   } catch (error) {
-    elements.uploadStatus.textContent = error.message;
+    let reconciled = false;
+    let restoredFromServer = false;
+    try {
+      reconciled = await reconcileThreadDetail({
+        threadId,
+        expectedRevision: clearRevision,
+        tokens: state.clearingThreadTokens,
+        token: operationToken,
+      });
+      restoredFromServer = reconciled;
+    } catch {
+      const current = threadById(threadId);
+      if (
+        ownsThreadOperation(
+          state.clearingThreadTokens,
+          threadId,
+          operationToken,
+        ) &&
+        current &&
+        normalizedRevision(current.revision) === clearRevision
+      ) {
+        rollbackSnapshot.revision = clearRevision + 1;
+        upsertThread(rollbackSnapshot);
+        reconciled = true;
+      }
+    }
+    if (
+      reconciled &&
+      ownsThreadOperation(
+        state.clearingThreadTokens,
+        threadId,
+        operationToken,
+      ) &&
+      state.activeThreadId === threadId
+    ) {
+      resetRunInspection(
+        restoredFromServer
+          ? "Clear failed; refreshed the durable thread state."
+          : "Clear status unavailable; restored the previous local view.",
+      );
+      renderActiveThreadTitle();
+      renderMessages();
+      renderRuns(activeThread().loopRuns);
+      renderLoopPayload(activeThread().latest || emptyLoopPayload());
+    }
+    if (
+      ownsThreadOperation(
+        state.clearingThreadTokens,
+        threadId,
+        operationToken,
+      ) &&
+      state.activeThreadId === threadId
+    ) {
+      elements.uploadStatus.textContent = error.message;
+    }
+  } finally {
+    if (
+      ownsThreadOperation(
+        state.clearingThreadTokens,
+        threadId,
+        operationToken,
+      )
+    ) {
+      state.clearingThreadTokens.delete(threadId);
+    }
+    if (
+      !state.runningQuery &&
+      !state.deletingThreadTokens.has(state.activeThreadId) &&
+      !state.clearingThreadTokens.has(state.activeThreadId) &&
+      !state.uploadThreadTokens.has(state.activeThreadId)
+    ) {
+      setQueryControlsBusy(false);
+    }
+    renderThreads();
   }
 }
 
@@ -1826,6 +3379,7 @@ async function boot() {
   renderThreads();
   renderActiveThreadTitle();
   renderMessages();
+  resetRunInspection();
   renderRuns(activeThread().loopRuns);
   renderLoopPayload(activeThread().latest || emptyLoopPayload());
   elements.uploadButton.addEventListener("click", chooseDocumentFile);

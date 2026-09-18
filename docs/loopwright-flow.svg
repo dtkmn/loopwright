@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="650" viewBox="0 0 1600 650" role="img" aria-labelledby="title desc">
   <title id="title">Loopwright flow</title>
-  <desc id="desc">A diagram of Loopwright showing smart evidence routing, loop execution, guardrails, loop reports, sessions, replay, and optional framework adapters.</desc>
+  <desc id="desc">A diagram of Loopwright showing smart evidence routing, answer-loop execution, guardrails, loop reports, local session artifacts, and optional framework adapter exports.</desc>
   <defs>
     <style>
       .bg { fill: #f8fafc; }
@@ -34,13 +34,13 @@
 
   <rect class="bg" width="1600" height="650"/>
   <text class="title" x="54" y="54">Loopwright</text>
-  <text class="subtitle" x="54" y="84">Agent loop inspection for context, drafting, format checks, verification, retries, refusals, sessions, and replay.</text>
+  <text class="subtitle" x="54" y="84">Evidence-backed answer-loop recording today; cross-runtime inspection and comparison is the direction.</text>
 
   <rect class="band context" x="54" y="120" rx="14" ry="14" width="294" height="360"/>
-  <text class="label" x="80" y="158">Evidence Providers</text>
+  <text class="label" x="80" y="158">Context Routes</text>
   <rect class="box" x="80" y="186" rx="10" ry="10" width="238" height="68"/>
-  <text class="small" x="102" y="214">Smart Evidence</text>
-  <text class="tiny" x="102" y="236">Web, files, or direct</text>
+  <text class="small" x="102" y="214">Smart router</text>
+  <text class="tiny" x="102" y="236">Web, files, or no evidence</text>
   <rect class="box" x="80" y="274" rx="10" ry="10" width="238" height="68"/>
   <text class="small" x="102" y="302">Web snippets</text>
   <text class="tiny" x="102" y="324">DuckDuckGo evidence</text>
@@ -52,18 +52,18 @@
   <text class="label" x="436" y="158">Runtime Answer Loop</text>
   <rect class="box" x="436" y="186" rx="10" ry="10" width="200" height="68"/>
   <text class="small" x="460" y="214">Retrieve evidence</text>
-  <text class="tiny" x="460" y="236">Prompt-used chunks cite</text>
+  <text class="tiny" x="460" y="236">Skipped on direct route</text>
   <rect class="box" x="710" y="186" rx="10" ry="10" width="200" height="68"/>
   <text class="small" x="734" y="214">Draft answer</text>
   <text class="tiny" x="734" y="236">Ollama or hosted model</text>
   <rect class="box check" x="436" y="298" rx="10" ry="10" width="200" height="82"/>
-  <text class="small" x="460" y="326">Format + checks</text>
-  <text class="tiny" x="460" y="348">Readable Markdown</text>
-  <text class="tiny" x="460" y="366">Citations match evidence</text>
+  <text class="small" x="460" y="326">Verifier</text>
+  <text class="tiny" x="460" y="348">Cited support decision</text>
+  <text class="tiny" x="460" y="366">Mock: not_verified</text>
   <rect class="box check" x="710" y="298" rx="10" ry="10" width="200" height="82"/>
-  <text class="small" x="734" y="326">Verifier</text>
-  <text class="tiny" x="734" y="348">Real backend verifies</text>
-  <text class="tiny" x="734" y="366">Mock: not_verified</text>
+  <text class="small" x="734" y="326">Format + checks</text>
+  <text class="tiny" x="734" y="348">Readable Markdown</text>
+  <text class="tiny" x="734" y="366">Citations match evidence</text>
   <rect class="box" x="572" y="408" rx="10" ry="10" width="200" height="50"/>
   <text class="small" x="601" y="438">Final decision</text>
 
@@ -72,21 +72,22 @@
   <path class="arrow" d="M 810 254 V 298"/>
   <path class="arrow" d="M 710 340 H 636"/>
   <path class="ok" d="M 636 380 C 640 400 652 408 672 408"/>
-  <path class="fail" d="M 710 380 C 694 398 682 398 672 408"/>
-  <path class="soft-arrow" d="M 572 408 C 520 400 500 382 500 358"/>
-  <text class="tiny" x="462" y="447">retry once or refuse</text>
+  <path class="soft-arrow" d="M 436 340 H 420 V 170 H 900 C 934 170 934 220 910 220"/>
+  <text class="tiny" x="460" y="286">bounded retry: draft again</text>
 
   <rect class="band check" x="1010" y="120" rx="14" ry="14" width="248" height="360"/>
   <text class="label" x="1036" y="158">Guardrails</text>
   <rect class="box" x="1036" y="190" rx="10" ry="10" width="196" height="70"/>
-  <text class="small" x="1060" y="218">Middleware</text>
-  <text class="tiny" x="1060" y="240">Block, retry, refuse</text>
+  <text class="small" x="1060" y="212">Middleware</text>
+  <text class="tiny" x="1060" y="234">Block or refuse</text>
+  <text class="tiny" x="1060" y="252">Retry request fails closed</text>
   <rect class="box" x="1036" y="284" rx="10" ry="10" width="196" height="70"/>
   <text class="small" x="1060" y="312">Human review</text>
   <text class="tiny" x="1060" y="334">requires_review state</text>
   <rect class="box" x="1036" y="378" rx="10" ry="10" width="196" height="70"/>
-  <text class="small" x="1060" y="406">Redaction</text>
-  <text class="tiny" x="1060" y="428">Public traces stay safe</text>
+  <text class="small" x="1060" y="402">Public projection</text>
+  <text class="tiny" x="1060" y="422">Allowlist on every report</text>
+  <text class="tiny" x="1060" y="440">Guardrail terminal suppresses</text>
 
   <path class="soft-arrow" d="M 944 218 H 1010"/>
   <path class="soft-arrow" d="M 944 340 H 1010"/>
@@ -101,8 +102,8 @@
   <text class="small" x="1370" y="302">LoopSession</text>
   <text class="tiny" x="1370" y="324">Bounded run history</text>
   <rect class="box" x="1346" y="360" rx="10" ry="10" width="174" height="66"/>
-  <text class="small" x="1370" y="388">Replay JSONL</text>
-  <text class="tiny" x="1370" y="410">Local diagnostics</text>
+  <text class="small" x="1370" y="388">Session JSONL</text>
+  <text class="tiny" x="1370" y="410">Future inspect/diff input</text>
 
   <path class="soft-arrow" d="M 772 433 C 930 500 1160 500 1320 410"/>
   <path class="soft-arrow" d="M 1258 220 H 1320"/>
@@ -112,8 +113,8 @@
   <text class="label" x="436" y="553">Optional Adapter Exports</text>
   <text class="small" x="436" y="580">OpenAI trace-shaped JSON</text>
   <text class="small" x="698" y="580">LangGraph manifest</text>
-  <text class="small" x="928" y="580">Microsoft workflow events</text>
-  <text class="tiny" x="436" y="594">Frameworks are export targets first, not core runtime dependencies.</text>
+  <text class="small" x="928" y="580">Microsoft event export (planned)</text>
+  <text class="tiny" x="436" y="594">Adapters do not execute target framework runtimes.</text>
   <path class="soft-arrow" d="M 1433 480 C 1433 540 1258 558 1258 558"/>
 
   <rect class="box" x="54" y="520" rx="14" ry="14" width="294" height="82"/>

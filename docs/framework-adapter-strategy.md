@@ -2,14 +2,15 @@
 
 Status: implemented for dependency-free OpenAI trace-shaped export and
 LangGraph manifest export; Microsoft workflow event export remains planned.
-Date: 2026-06-24.
+Research baseline: 2026-06-24. Last reviewed: 2026-07-17.
 
 ## Purpose
 
 Loopwright should interoperate with current agent frameworks without letting
 any framework become the core product architecture. The internal contract remains
 `LoopReport`, `LoopSession`, provider-neutral phases, explicit verifier
-decisions, guardrail decisions, and local replay artifacts.
+decisions, guardrail decisions, and local diagnostic artifacts that may become
+future inspect/diff input.
 
 This note covers optional adapter directions for:
 
@@ -41,11 +42,14 @@ The useful internal adapter boundary is already mostly present:
   format checks, mechanical checks, verifier decisions, retries, refusals, final answers, and
   errors.
 - `LoopSession`: bounded in-memory run history keyed by `session_id`, with raw
-  JSONL export for local replay/debug artifacts.
+  JSONL export for local diagnostics and future inspect/diff input. Loopwright
+  does not currently replay or re-execute those records.
 - `LoopPolicy`: explicit guardrail policy, including no autonomous tools by
   default.
-- Public trace redaction: user-facing traces can redact terminal-decision
-  content; raw local replay artifacts are developer diagnostics.
+- Public artifact projection: adapters default to a versioned, public data
+  shape; raw local artifacts remain developer diagnostics. Projection is a
+  data-shaping boundary, not access control or a general secret/PII scrub, so
+  every artifact still requires review before sharing.
 
 The adapter strategy should export these surfaces. It should not replace them.
 
@@ -63,13 +67,13 @@ unless that capture is disabled.
 | Loopwright | OpenAI Trace Concept | Notes |
 | --- | --- | --- |
 | `LoopSession.session_id` | trace `group_id` | Groups related runs in one conversation/session. |
-| `LoopRun.run_id` | trace metadata and/or trace id suffix | Preserve the internal id; do not require OpenAI id format internally. |
+| `LoopRun.run_id` | trace metadata and deterministic trace identity | Preserve the raw internal id in metadata. Adapter v2 hashes `session_id` plus `run_id` into an OpenAI-shaped trace id and rejects duplicate run ids within a session. |
 | `LoopRun.context_provider` | trace metadata | Resolved provider, for example `document`, `web`, or `none`; requested provider metadata may be `smart` or legacy `auto`. |
 | `LoopStep.phase=context_select/retrieve` | custom span | These are Loopwright-specific context phases. |
-| `LoopStep.phase=draft` | generation-like span or custom span | Use generation span only if OpenAI SDK data shape can represent the model call honestly. |
+| `LoopStep.phase=draft` | custom span in adapter v2 | Current summaries are not typed OpenAI `GenerationSpanData`; do not claim a generation span yet. |
 | `LoopStep.phase=format_check` | custom span | Presentation/readability gate, not evidence verification. |
 | `LoopStep.phase=mechanical_check` | custom span | Deterministic check, not model generation. |
-| `LoopStep.phase=verify` | guardrail span or custom span | Treat as guardrail/verifier evidence; preserve outcome and reasons. |
+| `LoopStep.phase=verify` | custom span in adapter v2 | Model-verifier provenance is not proof that an OpenAI SDK guardrail ran. Preserve the projected verifier outcome without claiming a guardrail span. |
 | `LoopStep.phase=retry/refuse/error/final` | custom span | These are loop-control decisions. |
 | `LoopDecision` | span status/metadata | Keep original value. |
 
@@ -80,13 +84,21 @@ The offline exporter lives in `src.adapters.openai_trace`. It maps
 importing the OpenAI Agents SDK or sending data to a network exporter. Only later
 add an optional live exporter that uses Agents SDK tracing processors.
 
+Adapter v2 emits every current `LoopStep` as a custom span. It should specialize
+to generation or guardrail spans only after the typed loop contract records the
+fields required by those SDK span types, including explicit guardrail-trigger
+provenance.
+
+Each `span_data` object follows the OpenAI SDK custom-span export shape:
+`type`, `name`, and a `data` property bag containing the Loopwright fields.
+
 The first live adapter should be opt-in and should:
 
 - live outside the core query path;
 - require an explicit OpenAI API key;
 - disable sensitive data capture by default where the SDK permits it;
-- export redacted public reports unless the caller explicitly requests raw local
-  diagnostics;
+- export the public artifact projection unless the caller explicitly requests
+  raw local diagnostics, and treat both forms as potentially sensitive;
 - flush only after a completed run, never during a partially built trace.
 
 ### Non-Goals
@@ -94,7 +106,7 @@ The first live adapter should be opt-in and should:
 - Do not run the application through `Runner`.
 - Do not model file or web context as OpenAI tools until autonomous tool boundaries
   exist.
-- Do not send raw replay artifacts to OpenAI by default.
+- Do not send raw diagnostic artifacts to OpenAI by default.
 - Do not make `openai-agents` a core dependency.
 
 ## LangGraph Adapter
@@ -115,7 +127,7 @@ data across threads.
 | `LoopStep.phase` | node name or superstep label | Start as labels, not executable nodes. |
 | `LoopStep.metadata` | checkpoint metadata | Must stay JSON-safe. |
 | `LoopReport.final_decision` | terminal graph state | Preserve supported/not_verified/refuse/block/error. |
-| `LoopSession` JSONL | replay source | Not a LangGraph checkpointer yet. |
+| `LoopSession` JSONL | diagnostic/future inspect-diff source | Not a replay engine or LangGraph checkpointer. |
 
 ### Recommended Adapter
 
@@ -131,11 +143,14 @@ The manifest includes:
 - ordered phase list
 - terminal decision
 - checkpoint-like snapshots per step
-- references to source JSONL line numbers
+- source JSONL line references only when a JSONL caller, such as
+  `src.loop_export`, supplies that invocation-local metadata explicitly;
+  in-memory session exports leave those fields unset, and a detached export does
+  not identify its source artifact from a line number alone
 
-Only after the manifest proves useful should we consider a real LangGraph adapter.
-The first real adapter should likely be a read-only replay/checkpoint inspector,
-not a new execution engine.
+Only after the manifest proves useful should we consider a real LangGraph
+adapter. The first real adapter should likely be a read-only report and
+checkpoint-shaped inspector, not a replay claim or a new execution engine.
 
 ### Non-Goals
 
@@ -196,24 +211,47 @@ class LoopReportAdapter:
     adapter_name: str
     adapter_schema_version: str
 
-    def export_report(self, report: LoopReport, *, public: bool = True) -> dict:
+    def export_report(
+        self,
+        report: LoopReport,
+        *,
+        public: bool = True,
+        session_id: str | None = None,
+        source_jsonl_line: int | None = None,
+    ) -> dict:
         ...
 
-    def export_session(self, session: LoopSession, *, public: bool = True) -> dict:
+    def export_session(
+        self,
+        session: LoopSession,
+        *,
+        public: bool = True,
+        source_jsonl_lines: Sequence[int | None] | None = None,
+    ) -> dict:
         ...
 ```
 
 Rules:
 
-- Default to public/redacted export.
+- Default to the versioned public artifact projection. Do not describe it as
+  generic redaction: projection is not access control or a secret/PII scrub.
 - Require an explicit `public=False` or `raw=True` flag for local diagnostics.
-- Preserve `run_id`, `session_id`, phase order, final decision, self-check
-  outcome, verifier reasons, and guardrail decisions.
+- Preserve stable `run_id`, `session_id`, phase order, final decision, and
+  self-check outcome. Preserve content-bearing verifier or guardrail detail only
+  when the selected projection permits it.
+- Reject ambiguous adapter identities instead of generating colliding trace or
+  manifest records. Only emit invocation-local source-line metadata when the
+  caller provides it explicitly; a line number alone is not durable artifact
+  identity.
 - Never mutate `LoopReport` or `LoopSession`.
 - Never call model providers, tool providers, or network exporters from the
   basic mapping function.
 - Keep adapter schema versions separate from `loop-report/v1`.
-- Provide CLI export from JSONL replay artifacts through `src.loop_export`
+- The explicit invocation-local line metadata and collision-resistant identifier
+  contract is `openai-trace-export/v2` and
+  `langgraph-manifest-export/v2`; do not backport those shape changes under the
+  v1 labels.
+- Provide CLI export from JSONL diagnostic artifacts through `src.loop_export`
   instead of making downstream tools import application internals.
 
 ## Current And Proposed File Layout
@@ -252,16 +290,16 @@ or Python extras if packaging is introduced. Do not add these dependencies to
 
 ## Decision
 
-The next implementation should be a dependency-free adapter manifest/exporter,
-not a framework runtime integration.
+The current implementation is a dependency-free adapter manifest/exporter, not
+a framework runtime integration or replay engine.
 
 Recommended order:
 
 1. Add a dependency-free `LoopReport` adapter protocol and one JSON manifest
    exporter. Done for the OpenAI trace-shaped exporter.
-2. Add tests proving redacted default export and raw explicit export. Done for
-   OpenAI trace-shaped export, LangGraph manifest export, and the JSONL export
-   CLI.
+2. Add tests proving versioned public-projection default export and raw explicit
+   export. Done for OpenAI trace-shaped export, LangGraph manifest export, and
+   the JSONL export CLI.
 3. Add optional OpenAI trace-shaped export first, because its trace/span model is
    closest to current `LoopReport`. Done as an offline export, not a live SDK
    integration.

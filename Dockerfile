@@ -28,7 +28,7 @@ COPY . .
 
 # Create a non-root user and set permissions
 RUN addgroup --gid 1000 appuser && \
-    adduser --uid 1000 --gid 1000 --disabled-password appuser && \
+    adduser --uid 1000 --gid 1000 --disabled-password --gecos "" appuser && \
     mkdir -p /app/uploads /home/appuser/.cache && \
     chown -R appuser:appuser /app /home/appuser/.cache
 

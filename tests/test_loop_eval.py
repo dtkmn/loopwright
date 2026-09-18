@@ -29,6 +29,9 @@ def test_provider_free_loop_eval_scores_all_cases_with_loop_reports():
         "Provider-free golden model (provider-free-golden)"
     )
     assert launch_case.loop_report["run"]["context_provider"] == "document"
+    assert launch_case.loop_report["run"]["terminal_reason"] == "completed"
+    assert launch_case.forbidden_terms_present == []
+    assert launch_case.answer_contract_matched is True
     assert launch_case.phases == [
         "context_select",
         "retrieve",
@@ -38,10 +41,84 @@ def test_provider_free_loop_eval_scores_all_cases_with_loop_reports():
         "verify",
         "final",
     ]
+    verify_step = next(
+        step
+        for step in launch_case.loop_report["run"]["steps"]
+        if step["phase"] == "verify"
+    )
+    assert verify_step["verification"]["verifier_backend"] == "provider-free"
+    assert verify_step["verification"]["verifier_model_label"] == (
+        "Provider-free golden model (provider-free-golden)"
+    )
+    assert verify_step["verification"]["same_model_as_drafter"] is True
     refusal_case = result.case_results[-1]
     assert refusal_case.final_decision == "refuse"
     assert "refuse" in refusal_case.phases
     assert refusal_case.self_check_outcome == "needs_refusal"
+
+
+def test_provider_free_eval_rejects_false_claim_even_when_verifier_colludes():
+    class ColludingProviderFreeLLM(loop_eval.ProviderFreeGoldenLLM):
+        def _answer_response(self, prompt: str) -> str:
+            return (
+                "Project Phoenix launches in June 2026 on Mars [1]."
+            )
+
+        def _verifier_response(self, prompt: str) -> str:
+            return json.dumps(
+                {
+                    "outcome": "supported",
+                    "reason": "colluding verifier accepts the planted claim",
+                }
+            )
+
+    def build_colluding_qa(model, base_url, timeout):
+        qa = build_provider_free_qa(model, base_url, timeout)
+        qa.llm = ColludingProviderFreeLLM()
+        return qa
+
+    result = evaluate_model(
+        "provider-free-golden",
+        mode="fake",
+        cases=[loop_eval.GOLDEN_EVAL_CASES[0]],
+        qa_factory=build_colluding_qa,
+    )
+
+    assert result.passed is False
+    case = result.case_results[0]
+    assert case.self_check_outcome == "supported"
+    assert case.final_decision == "supported"
+    assert case.forbidden_terms_present == []
+    assert case.answer_contract_matched is False
+    assert case.passed is False
+
+
+def test_live_mode_does_not_enforce_fake_fixture_answer_wording():
+    class ValidVariantLLM(loop_eval.ProviderFreeGoldenLLM):
+        def _answer_response(self, prompt: str) -> str:
+            return (
+                "According to the document, Project Phoenix will launch "
+                "in June 2026 [1]."
+            )
+
+    def build_variant_qa(model, base_url, timeout):
+        qa = build_provider_free_qa(model, base_url, timeout)
+        qa.llm = ValidVariantLLM()
+        return qa
+
+    result = evaluate_model(
+        "valid-live-wording",
+        mode="ollama",
+        cases=[loop_eval.GOLDEN_EVAL_CASES[0]],
+        qa_factory=build_variant_qa,
+        unload_after=False,
+    )
+
+    assert result.passed is True
+    case = result.case_results[0]
+    assert case.self_check_outcome == "supported"
+    assert case.answer_contract_matched is None
+    assert case.passed is True
 
 
 def test_loop_eval_results_dict_has_artifact_schema_and_loop_evidence():
