@@ -39,7 +39,12 @@ jobs:
             uv.lock
 
       - name: Install audit tooling
-        run: python -m pip install --upgrade pip pip-audit
+        run: python -m pip install --upgrade pip pip-audit uv
+
+      - name: Export locked third-party dependencies
+        run: >-
+          uv export --locked --no-dev --no-emit-project --no-hashes
+          --output-file /tmp/loopwright-audit-requirements.txt
 
       - name: Run vulnerability audit
-        run: pip-audit -r requirements.txt --strict
+        run: pip-audit -r /tmp/loopwright-audit-requirements.txt --strict
