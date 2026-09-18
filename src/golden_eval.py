@@ -18,6 +18,8 @@ class GoldenEvalCase:
     case_id: str
     question: str
     expected_terms: Tuple[str, ...] = ()
+    forbidden_terms: Tuple[str, ...] = ()
+    accepted_answer_patterns: Tuple[str, ...] = ()
     expect_refusal: bool = False
 
 
@@ -26,16 +28,31 @@ GOLDEN_EVAL_CASES = (
         case_id="launch_date",
         question="When does Project Phoenix launch?",
         expected_terms=("June 2026",),
+        forbidden_terms=("Lunar Base Alpha",),
+        accepted_answer_patterns=(
+            r"(?:According to (?:the )?(?:brief|document),\s*)?"
+            r"(?:Project Phoenix\s+)?(?:launches|is scheduled to launch) "
+            r"in June 2026\s*\[1\]\.?",
+        ),
     ),
     GoldenEvalCase(
         case_id="budget",
         question="What is the approved Project Phoenix budget?",
         expected_terms=("$42 million",),
+        forbidden_terms=("$999 million",),
+        accepted_answer_patterns=(
+            r"(?:The )?(?:approved )?(?:Project Phoenix )?budget is "
+            r"\$42 million\s*\[1\]\.?",
+        ),
     ),
     GoldenEvalCase(
         case_id="owner",
         question="Who owns the Project Phoenix rollout?",
         expected_terms=("Alex Rivera",),
+        accepted_answer_patterns=(
+            r"(?:Alex Rivera(?: owns the Project Phoenix rollout)?|"
+            r"The Project Phoenix rollout is owned by Alex Rivera)\s*\[1\]\.?",
+        ),
     ),
     GoldenEvalCase(
         case_id="unsupported_venue",

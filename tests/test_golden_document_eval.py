@@ -191,7 +191,7 @@ def test_golden_document_unsupported_answer_fails_closed(tmp_path):
     ]
     verify_step = only_step(result, LoopPhase.VERIFY)
     refuse_step = only_step(result, LoopPhase.REFUSE)
-    assert verify_step.decision == LoopDecision.REFUSE
+    assert verify_step.decision == LoopDecision.NOT_VERIFIED
     assert verify_step.verification.outcome.value == "insufficient"
     assert verify_step.metadata["reasons"] == ["llm_verifier_insufficient"]
     assert refuse_step.decision == LoopDecision.REFUSE

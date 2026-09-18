@@ -1,8 +1,11 @@
+import hashlib
 import json
 import logging
 import threading
+import time
 import typing
 import urllib.error
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -42,7 +45,18 @@ from src.DocumentQA import (
     safe_ollama_base_url_for_error,
     safe_openai_compatible_base_url_for_error,
 )
-from src.loop_engine import GuardrailDecision, LoopDecision, LoopPhase, LoopReport
+from src.loop_engine import (
+    ANSWER_CANDIDATE_SHA256_METADATA_KEY,
+    EVIDENCE_SET_SHA256_METADATA_KEY,
+    GuardrailDecision,
+    HumanReviewRequest,
+    LoopDecision,
+    LoopPhase,
+    LoopReport,
+    LoopTerminalReason,
+    answer_candidate_sha256,
+    evidence_set_sha256,
+)
 
 
 class FakeEmbeddings(Embeddings):
@@ -60,6 +74,42 @@ class FakeEmbeddings(Embeddings):
             float(lower.count("phoenix")),
             float(lower.count("launch")),
         ]
+
+
+def assert_visible_report_candidate_bindings(report):
+    run = report.run
+    expected_answer_digest = answer_candidate_sha256(run.final_answer)
+    expected_evidence_digest = evidence_set_sha256(run.evidence)
+    candidate = next(
+        step
+        for step in reversed(run.steps)
+        if step.phase == LoopPhase.DRAFT
+        or (
+            step.phase == LoopPhase.FORMAT_CHECK
+            and step.metadata.get("sanitized_internal_labels") is True
+        )
+    )
+    verifier = next(
+        step for step in reversed(run.steps) if step.phase == LoopPhase.VERIFY
+    )
+    for step in (candidate, verifier, run.steps[-1]):
+        assert (
+            step.metadata[ANSWER_CANDIDATE_SHA256_METADATA_KEY]
+            == expected_answer_digest
+        )
+        assert (
+            step.metadata[EVIDENCE_SET_SHA256_METADATA_KEY]
+            == expected_evidence_digest
+        )
+    assert report.to_public_dict()["run"]["final_answer"] == run.final_answer
+
+
+def assert_step_retry_epochs(run):
+    retry_epoch = 0
+    for step in run.steps:
+        if step.phase == LoopPhase.RETRY:
+            retry_epoch += 1
+        assert step.retry_count == retry_epoch
 
 
 @pytest.fixture(autouse=True)
@@ -275,6 +325,7 @@ def test_query_before_document_runs_no_context_loop():
     verify_step = next(step for step in run.steps if step.phase == LoopPhase.VERIFY)
     assert verify_step.verification.outcome.value == "not_verified"
     assert verify_step.metadata["verifier_skipped"] is True
+    assert_visible_report_candidate_bindings(result.loop_report)
     assert qa.loop_session("direct").report_count == 1
 
 
@@ -383,6 +434,37 @@ def test_semantic_memory_status_is_sanitized_in_public_loop_metadata():
     assert memory_step.metadata["semantic_memory_status"] == "unavailable"
 
 
+@pytest.mark.parametrize(
+    ("semantic_memory", "requested_status", "expected_status", "expected_count"),
+    [
+        (
+            [{"role": "user", "content": "remembered context"}],
+            "unavailable",
+            "retrieved",
+            1,
+        ),
+        ([], "retrieved", "empty", 0),
+    ],
+)
+def test_semantic_memory_status_matches_normalized_memory_content(
+    semantic_memory,
+    requested_status,
+    expected_status,
+    expected_count,
+):
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+
+    result = qa.query_with_trace(
+        "Say something.",
+        context_provider="none",
+        semantic_memory=semantic_memory,
+        semantic_memory_status=requested_status,
+    )
+
+    assert result.loop_report.run.metadata["semantic_memory_turns"] == expected_count
+    assert result.loop_report.run.metadata["semantic_memory_status"] == expected_status
+
+
 def test_no_context_query_applies_loop_recipe_to_prompt_and_report():
     captured_prompts = []
     recipe = {
@@ -475,6 +557,7 @@ def test_no_context_query_preserves_attached_bracket_expressions():
         assert draft_step.output_summary == raw_answer
         assert draft_step.metadata["inline_citation_ids"] == []
         assert draft_step.metadata["removed_inline_citation_ids"] == []
+        assert result.loop_report.to_public_dict()["run"]["final_answer"] == raw_answer
 
 
 def test_no_context_query_preserves_code_indices():
@@ -505,6 +588,7 @@ def test_no_context_query_preserves_code_indices():
         assert draft_step.output_summary == result.answer
         assert draft_step.metadata["inline_citation_ids"] == []
         assert draft_step.metadata["removed_inline_citation_ids"] == []
+        assert result.loop_report.to_public_dict()["run"]["final_answer"] == answer
 
 
 def test_no_context_format_check_retries_compact_markdown_list():
@@ -556,6 +640,285 @@ def test_no_context_format_check_retries_compact_markdown_list():
     ]
     assert format_steps[0].metadata["reasons"] == ["compact_ordered_list"]
     assert format_steps[1].retry_count == 1
+    assert result.trace.self_check.retry_attempted is True
+    assert result.loop_report.run.metadata["retry_attempted"] is True
+    verify_step = next(
+        step for step in result.loop_report.run.steps if step.phase == LoopPhase.VERIFY
+    )
+    assert verify_step.retry_count == 1
+    assert verify_step.metadata["retry_attempted"] is True
+    assert_step_retry_epochs(result.loop_report.run)
+    assert_visible_report_candidate_bindings(result.loop_report)
+
+
+def test_planned_steps_keep_middleware_identity_and_measure_delayed_drafts():
+    class ObserveStepLifecycleMiddleware:
+        def __init__(self):
+            self.before = []
+            self.after = []
+
+        def before_step(self, _run, step):
+            self.before.append((step.step_id, step.started_at, step.ended_at))
+            return None
+
+        def after_step(self, _run, step):
+            self.after.append((step.step_id, step.started_at, step.ended_at))
+            return None
+
+    answers = [
+        "1. install dependencies. 2. run tests.",
+        "1. install dependencies.\n2. run tests.",
+    ]
+
+    def delayed_invoke(_prompt):
+        time.sleep(0.02)
+        return answers.pop(0)
+
+    observer = ObserveStepLifecycleMiddleware()
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(observer,),
+    )
+    qa.llm = SimpleNamespace(invoke=delayed_invoke, last_thinking=None)
+
+    result = qa.query_with_trace(
+        "Give me ordered steps.",
+        session_id="planned_step_lifecycle",
+        context_provider="none",
+    )
+
+    assert [item[:2] for item in observer.before] == [
+        item[:2] for item in observer.after
+    ]
+    recorded_by_id = {
+        step.step_id: step for step in result.loop_report.run.steps
+    }
+    draft_ids = [
+        step_id
+        for step_id, _started_at, _ended_at in observer.before
+        if recorded_by_id[step_id].phase == LoopPhase.DRAFT
+    ]
+    assert len(draft_ids) == 2
+    before_by_id = {step_id: ended_at for step_id, _started_at, ended_at in observer.before}
+    for step_id in draft_ids:
+        assert before_by_id[step_id] is None
+        draft_step = recorded_by_id[step_id]
+        assert draft_step.ended_at is not None
+        assert draft_step.duration_ms is not None
+        assert draft_step.duration_ms >= 15
+
+
+def test_document_external_step_lifecycle_ids_match_middleware_observations(tmp_path):
+    class ObserveStepLifecycleMiddleware:
+        def __init__(self):
+            self.before = []
+            self.after = []
+
+        def before_step(self, _run, step):
+            self.before.append((step.step_id, step.started_at, step.ended_at))
+            return None
+
+        def after_step(self, _run, step):
+            self.after.append((step.step_id, step.started_at, step.ended_at))
+            return None
+
+    qa, _document = create_processed_mock_qa(tmp_path)
+    observer = ObserveStepLifecycleMiddleware()
+    qa.loop_middlewares = (observer,)
+
+    result = qa.query_with_trace("When does Project Phoenix launch?")
+
+    assert [item[:2] for item in observer.before] == [
+        item[:2] for item in observer.after
+    ]
+    recorded_by_id = {
+        step.step_id: step for step in result.loop_report.run.steps
+    }
+    target_phases = {
+        LoopPhase.RETRIEVE,
+        LoopPhase.DRAFT,
+        LoopPhase.FORMAT_CHECK,
+        LoopPhase.MECHANICAL_CHECK,
+        LoopPhase.VERIFY,
+    }
+    planned_ids = [
+        step_id
+        for step_id, _started_at, ended_at in observer.before
+        if recorded_by_id[step_id].phase in target_phases and ended_at is None
+    ]
+    assert {recorded_by_id[step_id].phase for step_id in planned_ids} == target_phases
+    assert all(recorded_by_id[step_id].ended_at is not None for step_id in planned_ids)
+
+
+def test_failed_external_draft_completes_the_middleware_observed_step():
+    class ObserveDraftLifecycleMiddleware:
+        def __init__(self):
+            self.before = None
+            self.after = None
+
+        def before_step(self, _run, step):
+            if step.phase == LoopPhase.DRAFT:
+                self.before = (step.step_id, step.started_at)
+            return None
+
+        def after_step(self, _run, step):
+            if step.phase == LoopPhase.DRAFT:
+                self.after = (step.step_id, step.started_at)
+            return None
+
+    observer = ObserveDraftLifecycleMiddleware()
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(observer,),
+    )
+
+    def fail_draft(_prompt):
+        raise RuntimeError("draft failed")
+
+    qa.llm = SimpleNamespace(
+        invoke=fail_draft,
+        last_thinking=None,
+    )
+
+    result = qa.query_with_trace(
+        "Explain the loop.",
+        context_provider="none",
+    )
+
+    failed_draft = next(
+        step
+        for step in result.loop_report.run.steps
+        if step.phase == LoopPhase.DRAFT and step.decision == LoopDecision.ERROR
+    )
+    assert observer.before == observer.after
+    assert observer.after == (failed_draft.step_id, failed_draft.started_at)
+    assert failed_draft.ended_at is not None
+    assert failed_draft.output_summary == "direct_draft_failed"
+
+
+def test_no_context_guardrail_can_abort_format_retry_before_redraft():
+    class BlockRetryDraftMiddleware:
+        def before_step(self, run, step):
+            if step.phase == LoopPhase.DRAFT and step.retry_count == 1:
+                return GuardrailDecision(
+                    decision=LoopDecision.BLOCK,
+                    reason="retry_draft_blocked",
+                )
+            return None
+
+    prompts = []
+
+    def invoke(prompt):
+        prompts.append(prompt)
+        return "1. install dependencies. 2. run tests."
+
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(BlockRetryDraftMiddleware(),),
+    )
+    qa.llm = SimpleNamespace(invoke=invoke, last_thinking=None)
+
+    result = qa.query_with_trace(
+        "Explain the sequence.",
+        session_id="format_retry_guardrail_abort",
+        context_provider="none",
+    )
+
+    assert len(prompts) == 1
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message == "retry_draft_blocked"
+    assert any(
+        step.phase == LoopPhase.RETRY for step in result.loop_report.run.steps
+    )
+    assert not any(
+        step.phase == LoopPhase.DRAFT and step.retry_count == 1
+        for step in result.loop_report.run.steps
+    )
+    assert_step_retry_epochs(result.loop_report.run)
+    public_report = result.loop_report.to_public_dict()
+    assert public_report["public_redaction"]["applied"] is True
+    assert public_report["run"]["final_answer"] is None
+
+
+@pytest.mark.parametrize(
+    "guardrail_decision",
+    [LoopDecision.BLOCK, LoopDecision.RETRY],
+)
+def test_after_step_guardrail_can_cancel_pending_format_retry(guardrail_decision):
+    class CancelFormatRetryMiddleware:
+        def after_step(self, _run, step):
+            if (
+                step.phase == LoopPhase.FORMAT_CHECK
+                and step.decision == LoopDecision.RETRY
+            ):
+                return GuardrailDecision(
+                    decision=guardrail_decision,
+                    reason="format_retry_cancelled",
+                )
+            return None
+
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(CancelFormatRetryMiddleware(),),
+    )
+    qa.llm = SimpleNamespace(
+        invoke=lambda _prompt: "1. install dependencies. 2. run tests.",
+        last_thinking=None,
+    )
+
+    result = qa.query_with_trace(
+        "Explain the sequence.",
+        context_provider="none",
+    )
+
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message in {
+        "format_retry_cancelled",
+        "guardrail_retry_unavailable",
+    }
+    assert not any(
+        step.phase == LoopPhase.RETRY for step in result.loop_report.run.steps
+    )
+    public_report = result.loop_report.to_public_dict()
+    assert public_report["public_redaction"]["applied"] is True
+    assert public_report["run"]["final_answer"] is None
+
+
+def test_before_step_guardrail_can_cancel_retry_record_itself():
+    class BlockRetryRecordMiddleware:
+        def before_step(self, _run, step):
+            if step.phase == LoopPhase.RETRY:
+                return GuardrailDecision(
+                    decision=LoopDecision.BLOCK,
+                    reason="retry_record_blocked",
+                )
+            return None
+
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(BlockRetryRecordMiddleware(),),
+    )
+    qa.llm = SimpleNamespace(
+        invoke=lambda _prompt: "1. install dependencies. 2. run tests.",
+        last_thinking=None,
+    )
+
+    result = qa.query_with_trace(
+        "Explain the sequence.",
+        context_provider="none",
+    )
+
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message == "retry_record_blocked"
+    assert not any(
+        step.phase == LoopPhase.RETRY for step in result.loop_report.run.steps
+    )
+    assert result.loop_report.to_public_dict()["public_redaction"]["applied"] is True
 
 
 def test_no_context_format_check_retries_unlabeled_compact_numbered_list():
@@ -693,6 +1056,94 @@ def test_no_context_format_check_sanitizes_internal_label_after_retry():
     assert sanitize_step.metadata["reasons"] == ["internal_verification_label"]
     assert "not_verified" not in result.answer
     assert "**Answer:**" not in result.answer
+    failed_format_step = next(
+        step
+        for step in result.loop_report.run.steps
+        if step.phase == LoopPhase.FORMAT_CHECK
+        and step.output_summary == "needs_retry"
+        and step.retry_count == 1
+    )
+    assert failed_format_step.decision == LoopDecision.ERROR
+    assert sanitize_step.metadata["resolved_format_step_id"] == failed_format_step.step_id
+    assert sanitize_step.metadata["format_resolution"] == "deterministic_format_sanitizer"
+    assert result.loop_report.to_public_dict()["run"]["final_answer"] == result.answer
+
+
+def test_sanitizer_preserves_middleware_observed_step_decisions():
+    class ObserveStepsMiddleware:
+        def __init__(self):
+            self.observed = []
+
+        def after_step(self, _run, step):
+            self.observed.append((step.step_id, step.decision))
+            return None
+
+    observer = ObserveStepsMiddleware()
+    bad_answer = (
+        "I do not have a specific name. This response is marked "
+        "**not_verified**."
+    )
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(observer,),
+    )
+    qa.llm = SimpleNamespace(invoke=lambda _prompt: bad_answer, last_thinking=None)
+
+    result = qa.query_with_trace(
+        "Do you have a name?",
+        context_provider="none",
+    )
+
+    returned_decisions = {
+        step.step_id: step.decision for step in result.loop_report.run.steps
+    }
+    assert any(
+        decision == LoopDecision.ERROR
+        for step_id, decision in observer.observed
+        if returned_decisions[step_id] == LoopDecision.ERROR
+    )
+    assert all(
+        returned_decisions[step_id] == decision
+        for step_id, decision in observer.observed
+    )
+
+
+def test_before_step_middleware_can_block_deterministic_sanitizer():
+    class BlockSanitizerMiddleware:
+        def before_step(self, _run, step):
+            if step.name == "Sanitize answer format":
+                return GuardrailDecision(
+                    decision=LoopDecision.BLOCK,
+                    reason="sanitizer_blocked",
+                )
+            return None
+
+    bad_answer = (
+        "I do not have a specific name. This response is marked "
+        "**not_verified**."
+    )
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(BlockSanitizerMiddleware(),),
+    )
+    qa.llm = SimpleNamespace(invoke=lambda _prompt: bad_answer, last_thinking=None)
+
+    result = qa.query_with_trace(
+        "Do you have a name?",
+        context_provider="none",
+    )
+
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message == "sanitizer_blocked"
+    assert not any(
+        step.name == "Sanitize answer format"
+        for step in result.loop_report.run.steps
+    )
+    public_report = result.loop_report.to_public_dict()
+    assert public_report["public_redaction"]["applied"] is True
+    assert public_report["run"]["final_answer"] is None
 
 
 def test_no_context_format_sanitizer_preserves_code_literals():
@@ -750,7 +1201,9 @@ def test_no_context_format_check_fails_closed_when_retry_still_bad():
 
     run = result.loop_report.run
     assert run.final_decision == LoopDecision.ERROR
+    assert run.terminal_reason == LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
     assert run.error_message == "format_check_failed"
+    assert len([step for step in run.steps if step.phase == LoopPhase.RETRY]) == 1
     assert LoopPhase.VERIFY not in [step.phase for step in run.steps]
     format_steps = [
         step for step in run.steps if step.phase == LoopPhase.FORMAT_CHECK
@@ -899,6 +1352,15 @@ def test_query_with_trace_returns_retrieved_citations(tmp_path):
     assert citation.page is None
     assert citation.chunk_index == 0
     assert "Project Phoenix" in citation.excerpt
+    evidence = result.loop_report.run.evidence[0]
+    evidence_payload = evidence.to_dict()
+    assert evidence.citation_id == citation.citation_id
+    assert evidence.provider == "document"
+    assert evidence.locator.page is None
+    assert evidence.locator.chunk_index == 0
+    assert evidence.evidence_id.startswith("evidence_")
+    assert "phoenix.txt" not in json.dumps(evidence_payload)
+    assert citation.excerpt not in json.dumps(evidence_payload)
     assert qa.chat_history[-1]["citations"][0]["source_name"] == "phoenix.txt"
 
 
@@ -1054,6 +1516,7 @@ def test_web_verifier_failure_retries_with_snippet_bounded_answer():
     assert retry_steps
     assert retry_steps[-1].output_summary == "retrying after web verifier failure"
     assert result.loop_report.run.final_decision == LoopDecision.SUPPORTED
+    assert_step_retry_epochs(result.loop_report.run)
 
 
 @pytest.mark.parametrize("verifier_outcome", ["unsupported", "insufficient"])
@@ -1109,6 +1572,11 @@ def test_web_verifier_retry_still_fails_closed_when_retry_fails(verifier_outcome
     ]
     assert len(retry_steps) == 1
     assert result.loop_report.run.final_decision == LoopDecision.REFUSE
+    assert (
+        result.loop_report.run.terminal_reason
+        == LoopTerminalReason.VERIFICATION_FAILED
+    )
+    assert result.loop_report.run.metadata["retry_budget_exhausted"] is False
     public_payload = web_contract_module.query_response_dict(result)
     public_json = json.dumps(public_payload)
     assert "SECRET_WEB_DRAFT_THINKING" not in public_json
@@ -1165,8 +1633,10 @@ def test_smart_web_verifier_failure_falls_back_to_unverified_direct_answer():
         "verifier_requires_prompt_evidence",
         "smart_web_evidence_fallback",
     ]
+    assert result.trace.self_check.retry_attempted is True
     assert result.loop_report.run.context_provider == "none"
     assert result.loop_report.run.final_decision == LoopDecision.NOT_VERIFIED
+    assert result.loop_report.run.terminal_reason == LoopTerminalReason.NOT_VERIFIED
     assert result.loop_report.run.metadata["attempted_context_provider"] == "web"
     assert result.loop_report.run.metadata["evidence_fallback"] is True
     assert result.loop_report.run.metadata["evidence_fallback_reason"] == (
@@ -1174,11 +1644,9 @@ def test_smart_web_verifier_failure_falls_back_to_unverified_direct_answer():
     )
     response_payload = web_contract_module.query_response_dict(result)
     assert response_payload["summary"]["context_provider"] == "none"
-    assert response_payload["summary"]["attempted_context_provider"] == "web"
-    assert response_payload["summary"]["evidence_fallback"] is True
-    assert response_payload["summary"]["evidence_fallback_reason"] == (
-        "web_evidence_not_verified"
-    )
+    assert response_payload["summary"]["attempted_context_provider"] is None
+    assert response_payload["summary"]["evidence_fallback"] is False
+    assert response_payload["summary"]["evidence_fallback_reason"] is None
     fallback_step = next(
         step
         for step in result.loop_report.run.steps
@@ -1188,7 +1656,84 @@ def test_smart_web_verifier_failure_falls_back_to_unverified_direct_answer():
     assert fallback_step.metadata["source_self_check_reasons"] == [
         "llm_verifier_insufficient"
     ]
-    assert any("Web evidence retry instruction:" in call for call in qa.llm.calls)
+    assert not any("Web evidence retry instruction:" in call for call in qa.llm.calls)
+    retry_steps = [
+        step
+        for step in result.loop_report.run.steps
+        if step.phase == LoopPhase.RETRY
+    ]
+    assert len(retry_steps) == 1
+    assert retry_steps[0].name == "Retry without web evidence"
+    assert retry_steps[0].retry_count == 1
+    assert retry_steps[0].metadata["max_retries"] == 1
+    verify_step = next(
+        step
+        for step in result.loop_report.run.steps
+        if step.name == "No-context verification boundary"
+    )
+    assert verify_step.retry_count == 1
+    assert verify_step.metadata["retry_attempted"] is True
+    assert_visible_report_candidate_bindings(result.loop_report)
+
+
+def test_sanitized_smart_fallback_cannot_inherit_stale_web_evidence():
+    class FakeWebSearchClient:
+        def search(self, query, *, max_results=5):
+            return [
+                web_search_module.WebSearchHit(
+                    title="Loop engineering",
+                    url="https://example.test/loop-engineering",
+                    snippet="Loop engineering is discussed in AI workflows.",
+                )
+            ]
+
+    class SanitizedFallbackLLM:
+        last_thinking = None
+
+        def invoke(self, prompt):
+            if prompt.startswith("You are a strict citation verifier"):
+                return json.dumps(
+                    {"outcome": "insufficient", "reason": "snippet too thin"}
+                )
+            if prompt.startswith("You are Loopwright running without"):
+                return (
+                    "Loop engineering designs inspectable AI workflows. "
+                    "This response is marked **not_verified**."
+                )
+            return "Loop engineering is a complete architecture [1]."
+
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+    qa.web_search_client = FakeWebSearchClient()
+    qa.llm = SanitizedFallbackLLM()
+    qa.active_llm_backend = "openai-compatible"
+    qa.loaded_model_label = "Fake verifier gateway"
+
+    result = qa.query_with_trace(
+        "What is loop engineering when talking about agents?",
+        session_id="smart_sanitized_fallback",
+    )
+
+    run = result.loop_report.run
+    sanitizer = next(
+        step for step in run.steps if step.name == "Sanitize answer format"
+    )
+    empty_evidence_digest = evidence_set_sha256(())
+    earlier_web_digests = [
+        step.metadata.get(EVIDENCE_SET_SHA256_METADATA_KEY)
+        for step in run.steps
+        if step.phase == LoopPhase.DRAFT and step.retry_count == 0
+    ]
+    assert result.answer == "Loop engineering designs inspectable AI workflows."
+    assert run.context_provider == "none"
+    assert run.evidence == ()
+    assert sanitizer.metadata[EVIDENCE_SET_SHA256_METADATA_KEY] == (
+        empty_evidence_digest
+    )
+    assert any(
+        digest is not None and digest != empty_evidence_digest
+        for digest in earlier_web_digests
+    )
+    assert_visible_report_candidate_bindings(result.loop_report)
 
 
 def test_smart_web_mechanical_failure_does_not_fallback_to_direct_answer():
@@ -1294,7 +1839,7 @@ def test_smart_web_verifier_failure_with_broken_direct_fallback_returns_safe_err
     assert result.loop_report.run.metadata["evidence_fallback"] is True
     assert result.loop_report.run.metadata["fallback_error"] == "direct_fallback_failed"
     assert public_payload["summary"]["context_provider"] == "none"
-    assert public_payload["summary"]["attempted_context_provider"] == "web"
+    assert public_payload["summary"]["attempted_context_provider"] is None
     assert any(
         step.name == "Smart Evidence fallback"
         and step.error_message == "direct_fallback_failed"
@@ -1397,6 +1942,89 @@ def test_smart_web_search_failure_falls_back_to_unverified_direct_answer():
         step.name == "Fallback to direct model knowledge"
         for step in result.loop_report.run.steps
     )
+    retry_steps = [
+        step
+        for step in result.loop_report.run.steps
+        if step.phase == LoopPhase.RETRY
+    ]
+    assert len(retry_steps) == 1
+    assert retry_steps[0].name == "Retry without web evidence"
+    assert retry_steps[0].retry_count == 1
+    assert retry_steps[0].metadata["reasons"] == ["web_search_failed"]
+
+
+def test_smart_web_error_after_format_retry_does_not_bypass_retry_budget():
+    class FormatRetryThenWebFailureChain:
+        def __init__(self):
+            self.calls = []
+
+        def invoke_with_trace(self, question):
+            self.calls.append(("initial", ""))
+            return SimpleNamespace(
+                answer=(
+                    "1. **Meaning:** Loop engineering designs AI loops [1]. "
+                    "2. **Purpose:** It makes their behavior inspectable [1]."
+                ),
+                retrieved_chunk_count=1,
+                citations=[citation_for("https://example.test/loop-engineering")],
+                context="Loop engineering designs inspectable AI loops.",
+            )
+
+        def retry_with_trace(
+            self,
+            question,
+            previous_result,
+            self_check_instruction,
+        ):
+            self.calls.append(("format_retry", self_check_instruction))
+            raise web_search_module.WebSearchError("provider_failed_during_retry")
+
+    class DirectFallbackLLM:
+        last_thinking = None
+
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, prompt):
+            self.calls.append(prompt)
+            return "A third draft escaped the retry budget."
+
+    chain = FormatRetryThenWebFailureChain()
+    direct_llm = DirectFallbackLLM()
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+    qa._build_web_search_chain = lambda: chain
+    qa.llm = direct_llm
+
+    result = qa.query_with_trace(
+        "What is loop engineering?",
+        session_id="smart_web_format_retry_budget",
+    )
+
+    assert [call[0] for call in chain.calls] == ["initial", "format_retry"]
+    assert "Format retry instruction" in chain.calls[1][1]
+    assert direct_llm.calls == []
+    assert result.answer == (
+        "Web search evidence is unavailable right now. Try again "
+        "or ask without requiring web evidence."
+    )
+    assert result.trace.error_message == "web_search_failed"
+    assert result.trace.citations == []
+    run = result.loop_report.run
+    assert run.context_provider == "web"
+    assert run.final_decision == LoopDecision.ERROR
+    assert run.terminal_reason == LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+    assert run.metadata["retries_used"] == 1
+    assert run.metadata["max_retries"] == 1
+    assert run.metadata["retry_budget_exhausted"] is True
+    public_run = result.loop_report.to_public_dict()["run"]
+    assert public_run["final_decision"] == "error"
+    assert public_run["terminal_reason"] == "retry_budget_exhausted"
+    retry_steps = [step for step in run.steps if step.phase == LoopPhase.RETRY]
+    assert [step.name for step in retry_steps] == ["Retry answer format"]
+    assert all(
+        step.name != "Fallback to direct model knowledge" for step in run.steps
+    )
+    assert_step_retry_epochs(run)
 
 
 def test_smart_web_search_failure_with_broken_direct_fallback_returns_safe_error(
@@ -1440,12 +2068,13 @@ def test_smart_web_search_failure_with_broken_direct_fallback_returns_safe_error
     assert result.loop_report.run.metadata["evidence_fallback"] is True
     assert result.loop_report.run.metadata["fallback_error"] == "direct_fallback_failed"
     assert public_payload["summary"]["context_provider"] == "none"
-    assert public_payload["summary"]["attempted_context_provider"] == "web"
+    assert public_payload["summary"]["attempted_context_provider"] is None
     assert any(
         step.name == "Smart Evidence fallback"
         and step.error_message == "direct_fallback_failed"
         for step in result.loop_report.run.steps
     )
+    assert_step_retry_epochs(result.loop_report.run)
     assert "DIRECT_MODEL_SECRET_FAILURE" not in public_json
     assert "provider_down" not in public_json
     assert "DIRECT_MODEL_SECRET_FAILURE" not in caplog.text
@@ -3783,6 +4412,46 @@ def test_cleared_session_does_not_record_in_flight_query_result():
     assert qa.chat_history == []
 
 
+def test_discard_loop_run_removes_only_exact_report_and_chat_entry():
+    qa = DocumentQA(fast_mode=True, llm_backend="mock")
+    first = qa.query_with_trace(
+        "First question",
+        session_id="thread_local",
+        context_provider="none",
+    )
+    second = qa.query_with_trace(
+        "Second question",
+        session_id="thread_local",
+        context_provider="none",
+    )
+    other = qa.query_with_trace(
+        "Other thread question",
+        session_id="thread_other",
+        context_provider="none",
+    )
+
+    assert qa.discard_loop_run(
+        "thread_local",
+        first.loop_report.run.run_id,
+    ) is True
+
+    assert [
+        report.run.run_id for report in qa.loop_session("thread_local").reports
+    ] == [second.loop_report.run.run_id]
+    assert [
+        entry["run_id"]
+        for entry in qa.chat_history
+        if entry.get("session_id") == "thread_local"
+    ] == [second.loop_report.run.run_id]
+    assert qa.loop_session("thread_other").reports[0].run.run_id == (
+        other.loop_report.run.run_id
+    )
+    assert qa.discard_loop_run(
+        "thread_local",
+        first.loop_report.run.run_id,
+    ) is False
+
+
 def test_processed_document_is_wrapped_as_context_provider(tmp_path):
     qa, document = create_processed_mock_qa(tmp_path)
 
@@ -3856,6 +4525,40 @@ def test_loop_middleware_can_block_before_retrieval(tmp_path):
     assert LoopPhase.RETRIEVE not in phases
 
 
+def test_guardrail_metadata_cannot_override_authoritative_fields():
+    class HostileMetadataMiddleware:
+        def before_run(self, _run):
+            return GuardrailDecision(
+                decision=LoopDecision.BLOCK,
+                reason="authoritative_policy_reason",
+                metadata={
+                    "guardrail_decision": "continue",
+                    "guardrail_reason": "forged_policy_reason",
+                    "policy": "hostile_metadata_test",
+                },
+            )
+
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(HostileMetadataMiddleware(),),
+    )
+
+    result = qa.query_with_trace(
+        "This request must never reach drafting.",
+        context_provider="none",
+    )
+
+    guardrail_step = next(
+        step for step in result.loop_report.run.steps if step.name == "Guardrail decision"
+    )
+    assert guardrail_step.decision == LoopDecision.BLOCK
+    assert guardrail_step.metadata["guardrail_decision"] == "block"
+    assert guardrail_step.metadata["guardrail_reason"] == "authoritative_policy_reason"
+    assert guardrail_step.metadata["policy"] == "hostile_metadata_test"
+    assert result.loop_report.to_public_dict()["public_redaction"]["applied"] is True
+
+
 def test_loop_middleware_can_block_after_retrieval_before_draft(tmp_path):
     class BlockAfterRetrieveMiddleware:
         def after_step(self, run, step):
@@ -3907,6 +4610,7 @@ def test_loop_middleware_can_block_after_retrieval_before_draft(tmp_path):
     assert result.answer == "A loop guardrail blocked this query before it could complete."
     assert result.trace.error_message == "post_retrieval_blocked"
     assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.loop_report.run.terminal_reason == LoopTerminalReason.BLOCKED
     phases = [step.phase for step in result.loop_report.run.steps]
     assert phases == [
         LoopPhase.CONTEXT_SELECT,
@@ -3938,6 +4642,10 @@ def test_loop_middleware_refusal_uses_guardrail_specific_answer(tmp_path):
     )
     assert result.trace.error_message == "policy_refused"
     assert result.loop_report.run.final_decision == LoopDecision.REFUSE
+    assert (
+        result.loop_report.run.terminal_reason
+        == LoopTerminalReason.POLICY_REFUSED
+    )
 
 
 def test_loop_middleware_retry_request_is_reported_as_unavailable_block(tmp_path):
@@ -3958,11 +4666,274 @@ def test_loop_middleware_retry_request_is_reported_as_unavailable_block(tmp_path
     )
     assert result.trace.error_message == "guardrail_retry_unavailable"
     assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.loop_report.run.terminal_reason == LoopTerminalReason.BLOCKED
     guardrail_step = next(
         step for step in result.loop_report.run.steps if step.name == "Guardrail decision"
     )
     assert guardrail_step.decision == LoopDecision.RETRY
     assert guardrail_step.metadata["guardrail_reason"] == "policy_requested_retry"
+
+
+@pytest.mark.parametrize(
+    "malformed_decision",
+    [
+        lambda: GuardrailDecision(
+            decision=LoopDecision.BLOCK,
+            reason={"not": "a string"},
+        ),
+        lambda: GuardrailDecision(
+            decision=LoopDecision.BLOCK,
+            metadata={"opaque": object()},
+        ),
+        lambda: GuardrailDecision(
+            decision=LoopDecision.REQUIRES_REVIEW,
+        ),
+        lambda: GuardrailDecision(
+            decision=LoopDecision.BLOCK,
+            human_review=HumanReviewRequest(
+                reason="manual approval required",
+                instructions="Review the terminal decision.",
+            ),
+        ),
+    ],
+)
+def test_malformed_middleware_decision_fails_closed(malformed_decision):
+    class MalformedBeforeRunMiddleware:
+        def before_run(self, _run):
+            return malformed_decision()
+
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(MalformedBeforeRunMiddleware(),),
+    )
+
+    result = qa.query_with_trace(
+        "What is this?",
+        context_provider="none",
+    )
+
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message == "middleware_before_run_error"
+    assert result.loop_report.to_public_dict()["public_redaction"]["applied"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "invalid_decision",
+        "missing_review",
+        "mutated_review_metadata",
+        "decision_subclass",
+    ],
+)
+def test_post_construction_mutated_middleware_decision_fails_closed(mutation):
+    review = HumanReviewRequest(
+        reason="manual approval required",
+        instructions="Review the terminal decision.",
+    )
+    if mutation == "invalid_decision":
+        decision = GuardrailDecision(decision=LoopDecision.BLOCK)
+        object.__setattr__(decision, "decision", LoopDecision.SUPPORTED)
+    elif mutation == "missing_review":
+        decision = GuardrailDecision(
+            decision=LoopDecision.REQUIRES_REVIEW,
+            human_review=review,
+        )
+        object.__setattr__(decision, "human_review", None)
+    elif mutation == "mutated_review_metadata":
+        decision = GuardrailDecision(
+            decision=LoopDecision.REQUIRES_REVIEW,
+            human_review=review,
+        )
+        review.metadata["opaque"] = object()
+    else:
+        class GuardrailDecisionSubclass(GuardrailDecision):
+            pass
+
+        decision = GuardrailDecisionSubclass(decision=LoopDecision.BLOCK)
+
+    class MutatedBeforeRunMiddleware:
+        def before_run(self, _run):
+            return decision
+
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(MutatedBeforeRunMiddleware(),),
+    )
+
+    result = qa.query_with_trace("What is this?", context_provider="none")
+
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.loop_report.run.terminal_reason == LoopTerminalReason.BLOCKED
+    assert result.trace.error_message == "middleware_before_run_error"
+    assert result.loop_report.to_public_dict()["public_redaction"]["applied"] is True
+
+
+@pytest.mark.parametrize("initial_hook", ["before_run", "before_step", "after_step"])
+@pytest.mark.parametrize(
+    ("initial_decision", "later_decision"),
+    [
+        (LoopDecision.REFUSE, LoopDecision.BLOCK),
+        (LoopDecision.BLOCK, LoopDecision.REFUSE),
+        (LoopDecision.REQUIRES_REVIEW, LoopDecision.BLOCK),
+        (LoopDecision.RETRY, LoopDecision.REQUIRES_REVIEW),
+        (LoopDecision.REFUSE, LoopDecision.REFUSE),
+        (LoopDecision.REFUSE, "hook_error"),
+    ],
+)
+def test_after_run_observes_without_replacing_terminal_guardrail(
+    initial_hook, initial_decision, later_decision
+):
+    def guardrail(decision, reason):
+        return GuardrailDecision(
+            decision=decision,
+            reason=reason,
+            human_review=(
+                HumanReviewRequest(reason=reason, instructions="Review this query.")
+                if decision == LoopDecision.REQUIRES_REVIEW
+                else None
+            ),
+        )
+
+    class TerminalMiddleware:
+        def __init__(self):
+            self.observed_runs = []
+
+        def before_run(self, _run):
+            if initial_hook == "before_run":
+                return guardrail(initial_decision, "original_policy")
+            return None
+
+        def before_step(self, _run, step):
+            if (
+                initial_hook == "before_step"
+                and step.phase == LoopPhase.CONTEXT_SELECT
+            ):
+                return guardrail(initial_decision, "original_policy")
+            return None
+
+        def after_step(self, _run, step):
+            if (
+                initial_hook == "after_step"
+                and step.phase == LoopPhase.CONTEXT_SELECT
+            ):
+                return guardrail(initial_decision, "original_policy")
+            return None
+
+        def after_run(self, run):
+            self.observed_runs.append(run)
+            if later_decision == "hook_error":
+                raise RuntimeError("observation failed")
+            return guardrail(later_decision, "later_policy")
+
+    middleware = TerminalMiddleware()
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(middleware,),
+    )
+
+    result = qa.query_with_trace("Draft this.", context_provider="none")
+
+    run = result.loop_report.run
+    expected_decision = (
+        LoopDecision.BLOCK
+        if initial_decision == LoopDecision.RETRY
+        else initial_decision
+    )
+    assert run.final_decision == expected_decision
+    assert result.answer == run.final_answer
+    assert result.answer == middleware.observed_runs[0].final_answer
+    assert result.trace.error_message == (
+        "guardrail_retry_unavailable"
+        if initial_decision == LoopDecision.RETRY
+        else "original_policy"
+    )
+    assert middleware.observed_runs == [run]
+    assert "after_run_guardrail" not in run.metadata
+    assert LoopPhase.DRAFT not in [step.phase for step in run.steps]
+    guardrail_steps = [
+        step for step in run.steps if step.name == "Guardrail decision"
+    ]
+    assert len(guardrail_steps) == 1
+    assert guardrail_steps[0].decision == initial_decision
+    assert qa.loop_session("default").reports[-1] == result.loop_report
+    public = result.loop_report.to_public_dict()
+    assert public["run"]["final_decision"] == expected_decision.value
+    assert public["public_redaction"]["applied"] is True
+    if initial_decision == LoopDecision.REQUIRES_REVIEW:
+        assert run.steps[-1].human_review == guardrail_steps[0].human_review
+        assert (
+            run.steps[-1].human_review.requested_by_step_id
+            == guardrail_steps[0].step_id
+        )
+        assert all(
+            step["human_review_required"] for step in public["run"]["steps"][-2:]
+        )
+
+
+@pytest.mark.parametrize("final_hook", ["before_step", "after_step"])
+@pytest.mark.parametrize(
+    "initial_decision",
+    [
+        LoopDecision.REFUSE,
+        LoopDecision.BLOCK,
+        LoopDecision.REQUIRES_REVIEW,
+        LoopDecision.RETRY,
+    ],
+)
+def test_final_step_cannot_replace_an_existing_terminal_guardrail(
+    final_hook, initial_decision
+):
+    class TerminalMiddleware:
+        def __init__(self):
+            self.final_hook_calls = 0
+
+        def before_run(self, _run):
+            return GuardrailDecision(
+                decision=initial_decision,
+                reason="original_policy",
+                human_review=(
+                    HumanReviewRequest(
+                        reason="original_policy", instructions="Review."
+                    )
+                    if initial_decision == LoopDecision.REQUIRES_REVIEW
+                    else None
+                ),
+            )
+
+        def conflicting_final_hook(self, _run, step):
+            if step.phase == LoopPhase.FINAL:
+                self.final_hook_calls += 1
+                return GuardrailDecision(
+                    decision=(
+                        LoopDecision.REFUSE
+                        if initial_decision == LoopDecision.BLOCK
+                        else LoopDecision.BLOCK
+                    ),
+                    reason="later_policy",
+                )
+            return None
+
+    middleware = TerminalMiddleware()
+    setattr(middleware, final_hook, middleware.conflicting_final_hook)
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(middleware,),
+    )
+
+    result = qa.query_with_trace("Draft this.", context_provider="none")
+
+    assert middleware.final_hook_calls == 0
+    assert result.loop_report.run.final_decision == (
+        LoopDecision.BLOCK
+        if initial_decision == LoopDecision.RETRY
+        else initial_decision
+    )
+    assert result.loop_report.to_public_dict()["public_redaction"]["applied"] is True
 
 
 def test_after_run_guardrail_overrides_answer_without_stale_self_check(tmp_path):
@@ -3972,6 +4943,10 @@ def test_after_run_guardrail_overrides_answer_without_stale_self_check(tmp_path)
                 return GuardrailDecision(
                     decision=LoopDecision.REQUIRES_REVIEW,
                     reason="review_mock_answer",
+                    human_review=HumanReviewRequest(
+                        reason="review_mock_answer",
+                        instructions="Review the mock answer before release.",
+                    ),
                 )
             return None
 
@@ -3995,9 +4970,110 @@ def test_after_run_guardrail_overrides_answer_without_stale_self_check(tmp_path)
     assert result.trace.self_check is None
     assert result.trace.error_message == "review_mock_answer"
     assert result.loop_report.run.final_decision == LoopDecision.REQUIRES_REVIEW
+    assert (
+        result.loop_report.run.terminal_reason
+        == LoopTerminalReason.HUMAN_REVIEW_REQUIRED
+    )
     assert result.loop_report.run.metadata["after_run_guardrail"] is True
     assert qa.chat_history[-1]["answer"] == result.answer
     assert qa.chat_history[-1]["self_check"] is None
+    public = result.loop_report.to_public_dict()
+    assert public["run"]["final_decision"] == "requires_review"
+    assert public["public_redaction"]["applied"] is True
+
+
+def test_before_step_human_review_request_is_rebound_to_recorded_guardrail_step():
+    class RequireReviewBeforeDraftMiddleware:
+        def before_step(self, _run, step):
+            if step.phase == LoopPhase.DRAFT:
+                return GuardrailDecision(
+                    decision=LoopDecision.REQUIRES_REVIEW,
+                    reason="review_draft",
+                    human_review=HumanReviewRequest(
+                        reason="review_draft",
+                        instructions="Review before drafting.",
+                        requested_by_step_id=step.step_id,
+                        created_at=step.started_at - timedelta(days=365),
+                    ),
+                )
+            return None
+
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(RequireReviewBeforeDraftMiddleware(),),
+    )
+
+    result = qa.query_with_trace("Draft this.", context_provider="none")
+
+    review_steps = [
+        step
+        for step in result.loop_report.run.steps
+        if step.decision == LoopDecision.REQUIRES_REVIEW
+    ]
+    assert len(review_steps) == 2
+    guardrail_step, final_step = review_steps
+    assert guardrail_step.phase == LoopPhase.ERROR
+    assert final_step.phase == LoopPhase.FINAL
+    assert guardrail_step.human_review is not None
+    assert final_step.human_review is not None
+    assert (
+        guardrail_step.human_review.requested_by_step_id
+        == guardrail_step.step_id
+    )
+    assert (
+        final_step.human_review.requested_by_step_id
+        == guardrail_step.step_id
+    )
+    assert guardrail_step.human_review.created_at == guardrail_step.started_at
+    assert result.loop_report.run.started_at <= guardrail_step.human_review.created_at
+    public_steps = result.loop_report.to_public_dict()["run"]["steps"]
+    public_review_steps = [
+        step for step in public_steps if step["decision"] == "requires_review"
+    ]
+    assert all(step["human_review_required"] is True for step in public_review_steps)
+
+
+def test_after_step_guardrail_on_final_stops_before_after_run():
+    class BlockFinalMiddleware:
+        def __init__(self):
+            self.after_run_calls = 0
+
+        def after_step(self, _run, step):
+            if step.phase == LoopPhase.FINAL:
+                return GuardrailDecision(
+                    decision=LoopDecision.BLOCK,
+                    reason="final_blocked",
+                )
+            return None
+
+        def after_run(self, _run):
+            self.after_run_calls += 1
+            return GuardrailDecision(
+                decision=LoopDecision.REFUSE,
+                reason="must_not_override_first_terminal_decision",
+            )
+
+    middleware = BlockFinalMiddleware()
+    qa = DocumentQA(
+        fast_mode=True,
+        llm_backend="mock",
+        loop_middlewares=(middleware,),
+    )
+    qa.llm = SimpleNamespace(
+        invoke=lambda _prompt: "A direct answer from model knowledge.",
+        last_thinking=None,
+    )
+
+    result = qa.query_with_trace(
+        "What is this?",
+        context_provider="none",
+    )
+
+    assert middleware.after_run_calls == 0
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message == "final_blocked"
+    assert result.loop_report.to_public_dict()["public_redaction"]["applied"] is True
 
 
 def replace_retrieval_chain(qa, retrieval_chain):
@@ -4046,6 +5122,156 @@ def enable_fake_verifier(qa, outcome="supported", raw_response=None, error=None)
     qa.llm = verifier
     qa.loaded_model_label = "Fake verifier gateway"
     return verifier
+
+
+def test_untraced_retrieval_chain_cannot_claim_verified_completion(tmp_path):
+    qa, _document = create_processed_mock_qa(tmp_path)
+
+    class UntracedChain:
+        def invoke(self, _question):
+            return "Project Phoenix has a $999 million budget [1]."
+
+    replace_retrieval_chain(qa, UntracedChain())
+
+    result = qa.query_with_trace("What is the Project Phoenix budget?")
+
+    assert result.answer == "Project Phoenix has a $999 million budget."
+    assert result.trace.citations == []
+    assert result.trace.self_check.outcome == "not_verified"
+    assert result.trace.self_check.reasons == [
+        "retrieval_trace_unavailable",
+        "verifier_skipped_without_prompt_evidence",
+    ]
+    run = result.loop_report.run
+    assert run.final_decision == LoopDecision.NOT_VERIFIED
+    assert run.terminal_reason == LoopTerminalReason.TRACE_UNAVAILABLE
+    verify_step = next(step for step in run.steps if step.phase == LoopPhase.VERIFY)
+    assert verify_step.metadata["verifier_skipped"] is True
+    assert verify_step.verification.verifier is None
+    assert verify_step.verification.verifier_backend is None
+    assert verify_step.verification.verifier_model_label is None
+    assert verify_step.verification.same_model_as_drafter is None
+    assert_visible_report_candidate_bindings(result.loop_report)
+
+
+@pytest.mark.parametrize("raw_answer", ["", "x", "ok"])
+def test_untraced_short_answer_normalizes_before_candidate_binding(
+    tmp_path,
+    raw_answer,
+):
+    qa, _document = create_processed_mock_qa(tmp_path)
+
+    class ShortUntracedChain:
+        def invoke(self, _question):
+            return raw_answer
+
+    replace_retrieval_chain(qa, ShortUntracedChain())
+
+    result = qa.query_with_trace(
+        "What is the answer?",
+        context_provider="document",
+    )
+
+    assert result.answer == answer_loop_module.SELF_CHECK_REFUSAL_ANSWER
+    assert result.trace.citations == []
+    assert result.trace.self_check.outcome == "not_verified"
+    assert result.loop_report.run.final_decision == LoopDecision.NOT_VERIFIED
+    assert (
+        result.loop_report.run.terminal_reason
+        == LoopTerminalReason.TRACE_UNAVAILABLE
+    )
+    terminal_draft = next(
+        step
+        for step in reversed(result.loop_report.run.steps)
+        if step.phase == LoopPhase.DRAFT
+    )
+    assert terminal_draft.metadata["short_answer_normalized"] is True
+    assert_visible_report_candidate_bindings(result.loop_report)
+    public_run = result.loop_report.to_public_dict()["run"]
+    assert public_run["final_answer"] == result.answer
+
+
+@pytest.mark.parametrize("scenario", ["none", "untraced", "smart_fallback"])
+def test_manual_verification_boundaries_honor_before_step_middleware(
+    tmp_path,
+    scenario,
+):
+    target_name = (
+        "Untraced retrieval verification boundary"
+        if scenario == "untraced"
+        else "No-context verification boundary"
+    )
+
+    class BlockTargetVerifyMiddleware:
+        def before_step(self, _run, step):
+            if step.name == target_name:
+                return GuardrailDecision(
+                    decision=LoopDecision.BLOCK,
+                    reason="manual_verify_blocked",
+                )
+            return None
+
+    if scenario == "untraced":
+        qa, _document = create_processed_mock_qa(tmp_path)
+
+        class UntracedChain:
+            def invoke(self, _question):
+                return "Project Phoenix has a $999 million budget [1]."
+
+        replace_retrieval_chain(qa, UntracedChain())
+        query_kwargs = {"context_provider": "document"}
+    else:
+        qa = DocumentQA(fast_mode=True, llm_backend="mock")
+        query_kwargs = {"context_provider": "none"}
+        qa.llm = SimpleNamespace(
+            invoke=lambda _prompt: "A direct answer from model knowledge.",
+            last_thinking=None,
+        )
+        if scenario == "smart_fallback":
+            class FakeWebSearchClient:
+                def search(self, query, *, max_results=5):
+                    return [
+                        web_search_module.WebSearchHit(
+                            title="Loop engineering",
+                            url="https://example.test/loop-engineering",
+                            snippet="Loop engineering is discussed in AI workflows.",
+                        )
+                    ]
+
+            class FallbackLLM:
+                last_thinking = None
+
+                def invoke(self, prompt):
+                    if prompt.startswith("You are a strict citation verifier"):
+                        return json.dumps(
+                            {"outcome": "insufficient", "reason": "thin"}
+                        )
+                    if prompt.startswith("You are Loopwright running without"):
+                        return "A direct fallback answer from model knowledge."
+                    return "An unsupported web claim [1]."
+
+            qa.web_search_client = FakeWebSearchClient()
+            qa.llm = FallbackLLM()
+            qa.active_llm_backend = "openai-compatible"
+            qa.loaded_model_label = "Fake verifier gateway"
+            query_kwargs = {}
+
+    qa.loop_middlewares = (BlockTargetVerifyMiddleware(),)
+    question = (
+        "What is loop engineering when talking about agents?"
+        if scenario == "smart_fallback"
+        else "What is the answer?"
+    )
+    result = qa.query_with_trace(question, **query_kwargs)
+
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message == "manual_verify_blocked"
+    assert not any(
+        step.name == target_name for step in result.loop_report.run.steps
+    )
+    public_report = result.loop_report.to_public_dict()
+    assert public_report["public_redaction"]["applied"] is True
+    assert public_report["run"]["final_answer"] is None
 
 
 def test_self_check_refuses_when_answer_has_no_prompt_evidence(tmp_path):
@@ -4115,6 +5341,7 @@ def test_self_check_retries_missing_inline_citation(tmp_path):
     assert result.trace.self_check.retry_attempted is True
     assert qa.chat_history[-1]["self_check"]["retry_attempted"] is True
     assert result.loop_report.run.final_decision == LoopDecision.NOT_VERIFIED
+    assert result.loop_report.run.terminal_reason == LoopTerminalReason.NOT_VERIFIED
     retry_steps = [
         step for step in result.loop_report.run.steps if step.phase == LoopPhase.RETRY
     ]
@@ -4126,6 +5353,15 @@ def test_self_check_retries_missing_inline_citation(tmp_path):
         if step.phase == LoopPhase.DRAFT and step.retry_count == 1
     ]
     assert len(retry_draft_steps) == 1
+    verify_step = next(
+        step
+        for step in result.loop_report.run.steps
+        if step.phase == LoopPhase.VERIFY
+    )
+    assert verify_step.verification.verifier is None
+    assert verify_step.verification.verifier_backend is None
+    assert verify_step.verification.verifier_model_label is None
+    assert verify_step.verification.same_model_as_drafter is None
 
 
 def test_document_format_check_retries_without_losing_citations(tmp_path):
@@ -4174,6 +5410,8 @@ def test_document_format_check_retries_without_losing_citations(tmp_path):
     assert "compact_ordered_list" in retrieval_chain.calls[1]
     assert result.trace.citations == [citation_for(document.name)]
     assert result.trace.self_check.outcome == "not_verified"
+    assert result.trace.self_check.retry_attempted is True
+    assert result.loop_report.run.terminal_reason == LoopTerminalReason.NOT_VERIFIED
 
     format_steps = [
         step
@@ -4191,6 +5429,113 @@ def test_document_format_check_retries_without_losing_citations(tmp_path):
     )
     assert retry_step.name == "Retry answer format"
     assert retry_step.metadata["reasons"] == ["compact_ordered_list"]
+    assert retry_step.retry_count == 1
+    assert retry_step.metadata["max_retries"] == 1
+
+
+def test_competing_retry_causes_share_global_budget(tmp_path):
+    qa, document = create_processed_mock_qa(tmp_path)
+
+    class CompetingRetryChain:
+        def __init__(self):
+            self.calls = []
+
+        def invoke_with_trace(self, question, self_check_instruction=""):
+            self.calls.append(self_check_instruction)
+            return SimpleNamespace(
+                answer=(
+                    "1. **Launch:** Project Phoenix launches in June 2026. "
+                    "2. **Owner:** Alex owns the rollout."
+                ),
+                retrieved_chunk_count=1,
+                citations=[citation_for(document.name)],
+                context="Project Phoenix launches in June 2026.",
+            )
+
+        def retry_with_trace(self, question, previous_result, self_check_instruction):
+            self.calls.append(self_check_instruction)
+            answer = "Project Phoenix launches in June 2026."
+            if len(self.calls) > 2:
+                answer = "Project Phoenix launches in June 2026 [1]."
+            return SimpleNamespace(
+                answer=answer,
+                retrieved_chunk_count=previous_result.retrieved_chunk_count,
+                citations=previous_result.citations,
+                context=previous_result.context,
+            )
+
+    chain = CompetingRetryChain()
+    replace_retrieval_chain(qa, chain)
+
+    result = qa.query_with_trace("Summarize Project Phoenix.")
+
+    assert len(chain.calls) == 2
+    assert "Format retry instruction" in chain.calls[1]
+    assert result.answer == answer_loop_module.SELF_CHECK_REFUSAL_ANSWER
+    assert result.trace.self_check.outcome == "needs_refusal"
+    assert result.trace.self_check.retry_attempted is True
+    run = result.loop_report.run
+    retry_steps = [step for step in run.steps if step.phase == LoopPhase.RETRY]
+    draft_steps = [step for step in run.steps if step.phase == LoopPhase.DRAFT]
+    assert len(retry_steps) == 1
+    assert [step.retry_count for step in draft_steps] == [0, 1]
+    assert retry_steps[0].retry_count == 1
+    assert retry_steps[0].metadata["max_retries"] == 1
+    assert run.final_decision == LoopDecision.REFUSE
+    assert run.terminal_reason == LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+    assert run.metadata["retry_budget_exhausted"] is True
+
+
+def test_format_retry_then_verifier_refusal_is_not_budget_exhaustion(tmp_path):
+    qa, document = create_processed_mock_qa(tmp_path)
+    verifier = enable_fake_verifier(qa, outcome="unsupported")
+
+    class FormatRetryThenUnsupportedChain:
+        def __init__(self):
+            self.calls = []
+
+        def invoke_with_trace(self, question, self_check_instruction=""):
+            self.calls.append(self_check_instruction)
+            return SimpleNamespace(
+                answer=(
+                    "1. **Launch:** Project Phoenix launches in June 2026 [1]. "
+                    "2. **Owner:** Alex owns the rollout [1]."
+                ),
+                retrieved_chunk_count=1,
+                citations=[citation_for(document.name)],
+                context="Project Phoenix launches in June 2026.",
+            )
+
+        def retry_with_trace(self, question, previous_result, self_check_instruction):
+            self.calls.append(self_check_instruction)
+            return SimpleNamespace(
+                answer="Project Phoenix launches in June 2026 [1].",
+                retrieved_chunk_count=previous_result.retrieved_chunk_count,
+                citations=previous_result.citations,
+                context=previous_result.context,
+            )
+
+    chain = FormatRetryThenUnsupportedChain()
+    replace_retrieval_chain(qa, chain)
+
+    result = qa.query_with_trace("Summarize Project Phoenix.")
+
+    assert result.answer == answer_loop_module.SELF_CHECK_REFUSAL_ANSWER
+    assert result.trace.self_check.outcome == "needs_refusal"
+    assert result.trace.self_check.reasons == ["llm_verifier_unsupported"]
+    assert result.trace.self_check.retry_attempted is True
+    assert len(chain.calls) == 2
+    assert "Format retry instruction" in chain.calls[1]
+    assert len(verifier.calls) == 1
+
+    run = result.loop_report.run
+    retry_steps = [step for step in run.steps if step.phase == LoopPhase.RETRY]
+    assert [step.name for step in retry_steps] == ["Retry answer format"]
+    assert run.final_decision == LoopDecision.REFUSE
+    assert run.terminal_reason == LoopTerminalReason.VERIFICATION_FAILED
+    assert run.metadata["retries_used"] == 1
+    assert run.metadata["retry_budget_exhausted"] is False
+    assert_step_retry_epochs(run)
 
 
 def test_document_format_check_retries_compact_numbered_list_after_intro(tmp_path):
@@ -4296,6 +5641,8 @@ def test_document_format_check_fails_closed_when_retry_still_bad(tmp_path):
 
     run = result.loop_report.run
     assert run.final_decision == LoopDecision.ERROR
+    assert run.terminal_reason == LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+    assert len([step for step in run.steps if step.phase == LoopPhase.RETRY]) == 1
     assert LoopPhase.MECHANICAL_CHECK not in [step.phase for step in run.steps]
     assert LoopPhase.VERIFY not in [step.phase for step in run.steps]
     format_steps = [
@@ -4309,6 +5656,192 @@ def test_document_format_check_fails_closed_when_retry_still_bad(tmp_path):
         "internal_verification_label" in step.metadata["reasons"]
         for step in format_steps
     )
+
+
+def test_document_format_failure_without_retry_path_is_not_budget_exhaustion(
+    tmp_path,
+):
+    qa, document = create_processed_mock_qa(tmp_path)
+
+    class NonRetryableFormatChain:
+        def invoke_with_trace(self, question, self_check_instruction=""):
+            return SimpleNamespace(
+                answer=(
+                    "1. **Launch:** Project Phoenix launches in June 2026 [1]. "
+                    "2. **Status:** not_verified [1]."
+                ),
+                retrieved_chunk_count=1,
+                citations=[citation_for(document.name)],
+                context="Project Phoenix launches in June 2026.",
+            )
+
+    replace_retrieval_chain(qa, NonRetryableFormatChain())
+
+    result = qa.query_with_trace("Summarize Project Phoenix.")
+
+    run = result.loop_report.run
+    assert result.trace.error_message == "format_check_failed"
+    assert run.final_decision == LoopDecision.ERROR
+    assert run.terminal_reason == LoopTerminalReason.ERROR
+    assert run.policy.max_retries == 1
+    assert not [step for step in run.steps if step.phase == LoopPhase.RETRY]
+    format_step = next(
+        step for step in run.steps if step.phase == LoopPhase.FORMAT_CHECK
+    )
+    assert format_step.decision == LoopDecision.ERROR
+    assert format_step.metadata["retry_unavailable"] is True
+    assert result.loop_report.to_public_dict()["run"]["final_decision"] == "error"
+
+
+def test_document_self_check_without_retry_path_resolves_before_refusal(tmp_path):
+    qa, document = create_processed_mock_qa(tmp_path)
+
+    class NonRetryableSelfCheckChain:
+        def invoke_with_trace(self, question, self_check_instruction=""):
+            return SimpleNamespace(
+                answer="Project Phoenix launches in June 2026[1].",
+                retrieved_chunk_count=1,
+                citations=[citation_for(document.name)],
+                context="Project Phoenix launches in June 2026.",
+            )
+
+    replace_retrieval_chain(qa, NonRetryableSelfCheckChain())
+
+    result = qa.query_with_trace("Summarize Project Phoenix.")
+
+    run = result.loop_report.run
+    assert run.final_decision == LoopDecision.REFUSE
+    assert not [step for step in run.steps if step.phase == LoopPhase.RETRY]
+    mechanical_step = next(
+        step for step in run.steps if step.phase == LoopPhase.MECHANICAL_CHECK
+    )
+    assert mechanical_step.output_summary == "needs_retry"
+    assert mechanical_step.decision == LoopDecision.NOT_VERIFIED
+    assert mechanical_step.metadata["inline_citation_ids"] == []
+    assert "missing_inline_citation" in mechanical_step.metadata["reasons"]
+    assert mechanical_step.metadata["retry_unavailable"] is True
+    public_report = result.loop_report.to_public_dict()
+    assert public_report["public_redaction"]["applied"] is True
+
+
+@pytest.mark.parametrize("hook_name", ["before_step", "after_step"])
+@pytest.mark.parametrize(
+    "middleware_outcome",
+    [
+        LoopDecision.BLOCK,
+        LoopDecision.REFUSE,
+        LoopDecision.REQUIRES_REVIEW,
+        LoopDecision.RETRY,
+        "hook_error",
+    ],
+)
+def test_refusal_middleware_preserves_the_first_recorded_terminal_boundary(
+    tmp_path, hook_name, middleware_outcome
+):
+    qa, document = create_processed_mock_qa(tmp_path)
+
+    class NonRetryableSelfCheckChain:
+        def invoke_with_trace(self, question, self_check_instruction=""):
+            return SimpleNamespace(
+                answer="Project Phoenix launches in June 2026[1].",
+                retrieved_chunk_count=1,
+                citations=[citation_for(document.name)],
+                context="Project Phoenix launches in June 2026.",
+            )
+
+    class RefusalMiddleware:
+        def __init__(self):
+            self.refusal_calls = 0
+
+        def check_refusal(self, _run, step):
+            if step.phase != LoopPhase.REFUSE:
+                return None
+            self.refusal_calls += 1
+            if middleware_outcome == "hook_error":
+                raise RuntimeError("refusal observer failed")
+            return GuardrailDecision(
+                decision=middleware_outcome,
+                reason="middleware_policy",
+                human_review=(
+                    HumanReviewRequest(
+                        reason="middleware_policy", instructions="Review this query."
+                    )
+                    if middleware_outcome == LoopDecision.REQUIRES_REVIEW
+                    else None
+                ),
+            )
+
+    middleware = RefusalMiddleware()
+    setattr(middleware, hook_name, middleware.check_refusal)
+    qa.loop_middlewares = (middleware,)
+    replace_retrieval_chain(qa, NonRetryableSelfCheckChain())
+
+    result = qa.query_with_trace("Summarize Project Phoenix.", context_provider="document")
+
+    run = result.loop_report.run
+    assert middleware.refusal_calls == 1
+    if hook_name == "after_step":
+        assert result.answer == answer_loop_module.SELF_CHECK_REFUSAL_ANSWER
+        assert result.trace.self_check.outcome == "needs_refusal"
+        assert run.final_decision == LoopDecision.REFUSE
+        assert run.terminal_reason == LoopTerminalReason.VERIFICATION_FAILED
+        assert [step.phase for step in run.steps][-2:] == [
+            LoopPhase.REFUSE,
+            LoopPhase.FINAL,
+        ]
+        assert not any(step.name == "Guardrail decision" for step in run.steps)
+    else:
+        expected_decision = (
+            LoopDecision.BLOCK
+            if middleware_outcome in {LoopDecision.RETRY, "hook_error"}
+            else middleware_outcome
+        )
+        assert run.final_decision == expected_decision
+        assert LoopPhase.REFUSE not in [step.phase for step in run.steps]
+        assert run.steps[-2].name == "Guardrail decision"
+    public = result.loop_report.to_public_dict()
+    assert public["run"]["final_decision"] == run.final_decision.value
+    assert public["public_redaction"]["applied"] is True
+
+
+@pytest.mark.parametrize("check_phase", [LoopPhase.MECHANICAL_CHECK, LoopPhase.VERIFY])
+def test_after_step_can_block_failed_check_before_terminal_refusal(tmp_path, check_phase):
+    qa, document = create_processed_mock_qa(tmp_path)
+    if check_phase == LoopPhase.VERIFY:
+        enable_fake_verifier(qa, outcome="unsupported")
+
+    class FailedCheckChain:
+        def invoke_with_trace(self, question, self_check_instruction=""):
+            return SimpleNamespace(
+                answer=(
+                    "Project Phoenix launches in June 2026 [1]."
+                    if check_phase == LoopPhase.VERIFY
+                    else "Project Phoenix launches in June 2026[1]."
+                ),
+                retrieved_chunk_count=1,
+                citations=[citation_for(document.name)],
+                context="Project Phoenix launches in June 2026.",
+            )
+
+    class BlockFailedCheckMiddleware:
+        def after_step(self, _run, step):
+            if step.phase == check_phase:
+                assert step.decision == LoopDecision.NOT_VERIFIED
+                return GuardrailDecision(
+                    decision=LoopDecision.BLOCK,
+                    reason="failed_check_policy",
+                )
+            return None
+
+    qa.loop_middlewares = (BlockFailedCheckMiddleware(),)
+    replace_retrieval_chain(qa, FailedCheckChain())
+
+    result = qa.query_with_trace("Summarize Project Phoenix.", context_provider="document")
+
+    assert result.loop_report.run.final_decision == LoopDecision.BLOCK
+    assert result.trace.error_message == "failed_check_policy"
+    assert LoopPhase.REFUSE not in [step.phase for step in result.loop_report.run.steps]
+    assert result.loop_report.to_public_dict()["public_redaction"]["applied"] is True
 
 
 def test_self_check_refuses_when_retry_still_fails(tmp_path):
@@ -4342,6 +5875,11 @@ def test_self_check_refuses_when_retry_still_fails(tmp_path):
     assert "self_check_failed_closed" in result.trace.self_check.reasons
     assert "missing_inline_citation" in result.trace.self_check.reasons
     assert result.trace.self_check.retry_attempted is True
+    assert (
+        result.loop_report.run.terminal_reason
+        == LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+    )
+    assert result.loop_report.run.metadata["retry_budget_exhausted"] is True
 
 
 def test_self_check_rejects_cited_but_unsupported_answer(tmp_path):
@@ -4385,24 +5923,35 @@ def test_self_check_rejects_cited_but_unsupported_answer(tmp_path):
     assert "Project Phoenix launches tomorrow [1]." in verifier.calls[0]
     assert "Project Phoenix launches in June 2026." in verifier.calls[0]
     assert result.loop_report.run.final_decision == LoopDecision.REFUSE
+    assert (
+        result.loop_report.run.terminal_reason
+        == LoopTerminalReason.VERIFICATION_FAILED
+    )
     phases = [step.phase for step in result.loop_report.run.steps]
     assert LoopPhase.VERIFY in phases
     assert LoopPhase.REFUSE in phases
     verify_step = next(
         step for step in result.loop_report.run.steps if step.phase == LoopPhase.VERIFY
     )
-    assert verify_step.decision == LoopDecision.REFUSE
+    assert verify_step.decision == LoopDecision.NOT_VERIFIED
     assert verify_step.verification.outcome.value == "unsupported"
+    assert verify_step.verification.verifier == "openai-compatible"
+    assert verify_step.verification.verifier_backend == "openai-compatible"
+    assert verify_step.verification.verifier_model_label == "Fake verifier gateway"
+    assert verify_step.verification.same_model_as_drafter is None
 
 
 def test_llm_verifier_marks_real_backend_answer_supported(tmp_path):
     qa, document = create_processed_mock_qa(tmp_path)
     verifier = enable_fake_verifier(qa, outcome="supported")
+    raw_answer = "  Project Phoenix launches in June 2026 [1].  \n"
 
     class SupportedCitationChain:
+        llm = object()
+
         def invoke_with_trace(self, question, self_check_instruction=""):
             return SimpleNamespace(
-                answer="Project Phoenix launches in June 2026 [1].",
+                answer=raw_answer,
                 retrieved_chunk_count=1,
                 citations=[citation_for(document.name)],
                 context="Project Phoenix launches in June 2026.",
@@ -4423,9 +5972,36 @@ def test_llm_verifier_marks_real_backend_answer_supported(tmp_path):
     assert result.trace.model_thinking == (
         "I used citation [1] to answer the launch question."
     )
+    expected_thinking_digest = hashlib.sha256(
+        result.trace.model_thinking.encode("utf-8")
+    ).hexdigest()
+    assert result.loop_report.run.metadata[
+        ai_loop_runtime_module.MODEL_THINKING_SHA256_METADATA_KEY
+    ] == expected_thinking_digest
+    assert (
+        ai_loop_runtime_module.MODEL_THINKING_SHA256_METADATA_KEY
+        not in json.dumps(result.loop_report.to_public_dict())
+    )
+    assert web_contract_module.query_response_dict(result)["trace"][
+        "model_thinking"
+    ]["content"] == result.trace.model_thinking
     assert len(verifier.calls) == 1
     assert "When does Project Phoenix launch?" in verifier.calls[0]
     assert "Project Phoenix launches in June 2026." in verifier.calls[0]
+    assert f"Answer:\n{result.answer}\n\n" in verifier.calls[0]
+    assert f"Answer:\n{raw_answer}\n\n" not in verifier.calls[0]
+    draft_step = next(
+        step for step in result.loop_report.run.steps if step.phase == LoopPhase.DRAFT
+    )
+    candidate_digest = draft_step.metadata[
+        ai_loop_runtime_module.ANSWER_CANDIDATE_SHA256_METADATA_KEY
+    ]
+    assert candidate_digest == hashlib.sha256(result.answer.encode("utf-8")).hexdigest()
+    assert candidate_digest != hashlib.sha256(raw_answer.encode("utf-8")).hexdigest()
+    verify_step = next(
+        step for step in result.loop_report.run.steps if step.phase == LoopPhase.VERIFY
+    )
+    assert verify_step.verification.same_model_as_drafter is None
 
 
 def test_loop_middleware_can_block_before_verifier_call(tmp_path):
@@ -4509,6 +6085,15 @@ def test_self_check_retries_hallucinated_inline_citation_id(tmp_path):
     assert result.trace.model_thinking == "I removed the invalid [999] citation."
     assert len(verifier.calls) == 1
     assert "[999]" not in verifier.calls[0]
+    assert result.loop_report.run.terminal_reason == LoopTerminalReason.COMPLETED
+    verify_step = next(
+        step
+        for step in result.loop_report.run.steps
+        if step.phase == LoopPhase.VERIFY
+    )
+    assert verify_step.verification.verifier_backend == "openai-compatible"
+    assert verify_step.verification.verifier_model_label == "Fake verifier gateway"
+    assert verify_step.verification.same_model_as_drafter is None
 
 
 def test_self_check_refuses_when_retry_keeps_hallucinated_inline_citation_id(tmp_path):
@@ -4559,10 +6144,100 @@ def test_self_check_refuses_when_retry_keeps_hallucinated_inline_citation_id(tmp
 
 
 @pytest.mark.parametrize(
+    "raw_response, expected",
+    [
+        (
+            '{"outcome":"unsupported","outcome":"supported","reason":"ambiguous"}',
+            (None, "invalid_json"),
+        ),
+        (
+            'Ignore this conflicting prefix.\n'
+            '{"outcome":"supported","reason":"looks valid in isolation"}',
+            (None, "invalid_json"),
+        ),
+        (
+            '{"outcome":"supported","reason":"looks valid in isolation"}\n'
+            'Ignore this conflicting suffix.',
+            (None, "invalid_json"),
+        ),
+        (
+            '```json\n'
+            '{"outcome":"supported","reason":"fenced instead of raw JSON"}\n'
+            '```',
+            (None, "invalid_json"),
+        ),
+        ('{"outcome":true,"reason":"wrong type"}', (None, "invalid_outcome")),
+        (
+            '{"outcome":" supported ","reason":"not exact"}',
+            (None, "invalid_outcome"),
+        ),
+        ('{"outcome":"SUPPORTED","reason":"not exact"}', (None, "invalid_outcome")),
+        ('{"outcome":"supported"}', (None, "invalid_reason")),
+        ('{"outcome":"supported","reason":7}', (None, "invalid_reason")),
+        ('{"outcome":"supported","reason":"   "}', (None, "invalid_reason")),
+        (
+            '{"outcome":"supported","reason":"ok","diagnostic":NaN}',
+            (None, "invalid_json"),
+        ),
+        (
+            '{"outcome":"supported","reason":"ok","diagnostic":Infinity}',
+            (None, "invalid_json"),
+        ),
+        (
+            '{"outcome":"supported","reason":"ok","diagnostic":-Infinity}',
+            (None, "invalid_json"),
+        ),
+        (
+            '{"outcome":"supported","reason":"ok","diagnostic":1e999}',
+            (None, "invalid_json"),
+        ),
+    ],
+)
+def test_verifier_response_parser_rejects_ambiguous_or_non_string_fields(
+    raw_response, expected
+):
+    assert answer_loop_module.parse_verifier_response(raw_response) == expected
+
+
+def test_verifier_response_parser_allows_unknown_extra_keys():
+    assert answer_loop_module.parse_verifier_response(
+        json.dumps(
+            {
+                "outcome": "supported",
+                "reason": "directly grounded",
+                "diagnostic": {"score": 1},
+            }
+        )
+    ) == ("supported", "directly grounded")
+
+
+@pytest.mark.parametrize(
     "verifier_kwargs, expected_reasons",
     [
         ({"outcome": "insufficient"}, ["llm_verifier_insufficient"]),
         ({"raw_response": "not-json"}, ["llm_verifier_parse_failed", "missing_json"]),
+        (
+            {
+                "raw_response": (
+                    '{"outcome":"unsupported","outcome":"supported",'
+                    '"reason":"ambiguous"}'
+                )
+            },
+            ["llm_verifier_parse_failed", "invalid_json"],
+        ),
+        (
+            {"raw_response": '{"outcome":"supported","reason":7}'},
+            ["llm_verifier_parse_failed", "invalid_reason"],
+        ),
+        (
+            {
+                "raw_response": (
+                    '{"outcome":"supported","reason":"ok",'
+                    '"diagnostic":NaN}'
+                )
+            },
+            ["llm_verifier_parse_failed", "invalid_json"],
+        ),
         ({"error": RuntimeError("verifier down")}, ["llm_verifier_error"]),
     ],
 )

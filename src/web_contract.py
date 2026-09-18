@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import re
 from dataclasses import replace
-from typing import Optional
+from typing import Mapping, Optional
 
 try:
     from .ai_loop_engine import (
@@ -12,7 +15,9 @@ try:
         DocumentQAStatus,
         QueryResult,
     )
+    from .answer_loop import SELF_CHECK_REFUSAL_ANSWER
     from .loop_engine import PUBLIC_REDACTION_REASON, PUBLIC_REDACTION_TEXT
+    from .public_projection import PUBLIC_REPORT_PROJECTION_SCHEMA_VERSION
 except ImportError:
     from ai_loop_engine import (
         MAX_DOCUMENT_CHUNKS,
@@ -20,7 +25,9 @@ except ImportError:
         DocumentQAStatus,
         QueryResult,
     )
+    from answer_loop import SELF_CHECK_REFUSAL_ANSWER
     from loop_engine import PUBLIC_REDACTION_REASON, PUBLIC_REDACTION_TEXT
+    from public_projection import PUBLIC_REPORT_PROJECTION_SCHEMA_VERSION
 
 
 APP_TITLE = "Loopwright"
@@ -30,6 +37,11 @@ MODEL_THINKING_LABEL = "Model Thinking (unverified)"
 MODEL_THINKING_NOTE = (
     "Model-emitted thinking is useful for debugging the loop, but it is not "
     "verified evidence."
+)
+MODEL_THINKING_SHA256_METADATA_KEY = "model_thinking_sha256"
+MODEL_THINKING_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+ORDINARY_REFUSAL_TERMINAL_REASONS = frozenset(
+    {"verification_failed", "retry_budget_exhausted"}
 )
 TEXT_ENCODING_OPTIONS = {
     "Auto": "auto",
@@ -172,9 +184,9 @@ def public_trace_error(
     query_result: QueryResult,
     public_loop_report: Optional[dict],
 ) -> Optional[str]:
-    if visible_terminal_redaction_applied(query_result, public_loop_report):
-        return PUBLIC_REDACTION_REASON
-    return query_result.trace.error_message
+    if public_loop_report is None:
+        return None
+    return public_trace_error_from_report(public_loop_report)
 
 
 def public_loop_report_dict(query_result: QueryResult) -> Optional[dict]:
@@ -185,41 +197,77 @@ def public_loop_report_dict(query_result: QueryResult) -> Optional[dict]:
     )
 
 
-def terminal_public_redaction_applied(public_loop_report: Optional[dict]) -> bool:
+def terminal_public_redaction_applied(
+    public_loop_report: Optional[Mapping],
+) -> bool:
     redaction = (public_loop_report or {}).get("public_redaction") or {}
     return bool(redaction.get("applied"))
+
+
+def public_answer_text(
+    query_result: QueryResult,
+    public_loop_report: Optional[dict],
+) -> Optional[str]:
+    if public_loop_report is None:
+        return None
+    return public_answer_text_from_report(public_loop_report)
+
+
+def _ordinary_refusal_applied(public_loop_report: Mapping) -> bool:
+    run = public_loop_report.get("run")
+    return bool(
+        isinstance(run, Mapping)
+        and run.get("final_decision") == "refuse"
+        and run.get("terminal_reason") in ORDINARY_REFUSAL_TERMINAL_REASONS
+    )
+
+
+def _live_query_result_matches_public_report(
+    query_result: QueryResult,
+    public_loop_report: Optional[dict],
+) -> bool:
+    """Bind optional live-only trace fields to the projected run identity."""
+
+    loop_report = query_result.loop_report
+    if loop_report is None or public_loop_report is None:
+        return False
+
+    projected_run = public_loop_report.get("run")
+    if not isinstance(projected_run, Mapping):
+        return False
+    raw_run = loop_report.run
+    trace = query_result.trace
+    if (
+        projected_run.get("run_id") != raw_run.run_id
+        or projected_run.get("session_id") != raw_run.session_id
+        or query_result.answer != raw_run.final_answer
+        or trace.question != raw_run.user_input
+        or trace.backend != raw_run.backend
+        or trace.model_label != raw_run.model_label
+    ):
+        return False
+
+    projected_answer = projected_run.get("final_answer")
+    if projected_answer is not None and projected_answer != query_result.answer:
+        return False
+
+    return [citation.citation_id for citation in trace.citations] == [
+        reference.citation_id for reference in raw_run.evidence
+    ]
 
 
 def visible_terminal_redaction_applied(
     query_result: QueryResult,
     public_loop_report: Optional[dict],
 ) -> bool:
-    if not terminal_public_redaction_applied(public_loop_report):
-        return False
-    loop_report = query_result.loop_report
-    if loop_report is None:
-        return True
-    run = loop_report.run
-    final_decision = getattr(run.final_decision, "value", run.final_decision)
-    if final_decision in {"block", "requires_review"}:
-        return True
-    if final_decision != "refuse":
-        return True
-    if run.metadata.get("after_run_guardrail") or run.metadata.get("guardrail_decision"):
-        return True
-    for step in run.steps:
-        if step.human_review is not None:
-            return True
-        if step.metadata.get("guardrail_decision"):
-            return True
-    return False
+    return terminal_public_redaction_applied(public_loop_report)
 
 
 def model_thinking_dict(
     model_thinking: Optional[str], *, terminal_redaction: bool = False
 ) -> dict:
     thinking = model_thinking.strip() if isinstance(model_thinking, str) else ""
-    if terminal_redaction and thinking:
+    if terminal_redaction:
         return {
             "available": False,
             "redacted": True,
@@ -234,6 +282,34 @@ def model_thinking_dict(
         "content": thinking or None,
         "note": MODEL_THINKING_NOTE,
     }
+
+
+def _bound_model_thinking(
+    query_result: QueryResult,
+    *,
+    live_trace_matches: bool,
+) -> Optional[str]:
+    """Return thinking only when the raw run binds its exact live value."""
+
+    loop_report = query_result.loop_report
+    thinking = query_result.trace.model_thinking
+    if (
+        not live_trace_matches
+        or loop_report is None
+        or not isinstance(thinking, str)
+        or not thinking.strip()
+    ):
+        return None
+    expected_digest = loop_report.run.metadata.get(
+        MODEL_THINKING_SHA256_METADATA_KEY
+    )
+    if (
+        type(expected_digest) is not str
+        or MODEL_THINKING_SHA256_PATTERN.fullmatch(expected_digest) is None
+    ):
+        return None
+    actual_digest = hashlib.sha256(thinking.encode("utf-8")).hexdigest()
+    return thinking if hmac.compare_digest(expected_digest, actual_digest) else None
 
 
 def loop_phase_label(phase: Optional[str]) -> str:
@@ -258,47 +334,28 @@ def loop_phase_label(phase: Optional[str]) -> str:
 
 def loop_step_detail(step: dict) -> str:
     parts = []
-    output_summary = step.get("output_summary")
-    if output_summary:
-        parts.append(str(output_summary))
-    error_message = step.get("error_message")
-    if error_message and error_message != output_summary:
-        parts.append(f"error: {error_message}")
-
-    metadata = step.get("metadata") or {}
-    reasons = metadata.get("reasons") or []
-    if reasons:
-        parts.append(f"reasons: {', '.join(str(reason) for reason in reasons)}")
-    if metadata.get("retrieved_chunk_count") is not None:
-        parts.append(f"chunks: {metadata.get('retrieved_chunk_count')}")
-    if metadata.get("semantic_memory_count") is not None:
-        parts.append(f"memory: {metadata.get('semantic_memory_count')}")
-    if metadata.get("semantic_memory_status"):
-        parts.append(f"memory status: {metadata.get('semantic_memory_status')}")
-    citation_ids = metadata.get("citation_ids") or []
-    if citation_ids:
-        parts.append(f"citations: {', '.join(str(value) for value in citation_ids)}")
-    inline_ids = metadata.get("inline_citation_ids") or []
-    if inline_ids:
-        parts.append(
-            f"inline citations: {', '.join(str(value) for value in inline_ids)}"
-        )
-
     verification = step.get("verification") or {}
     if verification.get("outcome"):
         parts.append(f"verifier: {verification.get('outcome')}")
-    verification_reasons = verification.get("reasons") or []
-    if verification_reasons and not reasons:
-        parts.append(
-            "reasons: "
-            + ", ".join(str(reason) for reason in verification_reasons)
-        )
+
+    if step.get("error_present"):
+        parts.append("error present")
+    if step.get("human_review_required"):
+        parts.append("human review required")
 
     retry_count = step.get("retry_count") or 0
     if retry_count:
         parts.append(f"retry #{retry_count}")
 
     return "; ".join(parts) or "-"
+
+
+def _public_check_outcome(step: dict) -> Optional[str]:
+    if step.get("error_present") or step.get("decision") == "error":
+        return "failed"
+    if step.get("decision") == "retry":
+        return "retry"
+    return "passed"
 
 
 def loop_summary_dict(query_result: Optional[QueryResult]) -> dict:
@@ -324,13 +381,13 @@ def loop_summary_dict(query_result: Optional[QueryResult]) -> dict:
             "retry_attempted": False,
             "refused": False,
             "final_decision": None,
+            "terminal_reason": None,
             "last_error": None,
         }
 
     public_loop_report = public_loop_report_dict(query_result)
     run = (public_loop_report or {}).get("run") or {}
     steps = run.get("steps") or []
-    trace = query_result.trace
     format_steps = [
         step for step in steps if step.get("phase") == "format_check"
     ]
@@ -339,8 +396,6 @@ def loop_summary_dict(query_result: Optional[QueryResult]) -> dict:
     ]
     verify_steps = [step for step in steps if step.get("phase") == "verify"]
     retry_attempted = any(step.get("phase") == "retry" for step in steps)
-    if trace.self_check:
-        retry_attempted = retry_attempted or trace.self_check.retry_attempted
     final_decision = run.get("final_decision")
 
     verifier = None
@@ -349,54 +404,40 @@ def loop_summary_dict(query_result: Optional[QueryResult]) -> dict:
         verification = verify_step.get("verification") or {}
         verifier = {
             "decision": verify_step.get("decision"),
-            "outcome": verification.get("outcome")
-            or verify_step.get("output_summary"),
-            "reasons": verification.get("reasons")
-            or verify_step.get("metadata", {}).get("reasons", []),
+            "outcome": verification.get("outcome"),
+            "reasons": [],
         }
+
+    terminal_redaction = terminal_public_redaction_applied(public_loop_report)
+    evidence = run.get("evidence") or []
 
     return {
         "context_provider": run.get("context_provider"),
-        "attempted_context_provider": run.get("metadata", {}).get(
-            "attempted_context_provider"
-        ),
-        "evidence_fallback": bool(
-            run.get("metadata", {}).get("evidence_fallback")
-        ),
-        "evidence_fallback_reason": run.get("metadata", {}).get(
-            "evidence_fallback_reason"
-        ),
-        "document": trace.document_name,
-        "backend": trace.backend,
-        "model": trace.model_label,
-        "retrieved_chunk_count": trace.retrieved_chunk_count,
-        "conversation_context_count": run.get("metadata", {}).get(
-            "conversation_context_turns",
-            0,
-        ),
-        "semantic_memory_count": run.get("metadata", {}).get(
-            "semantic_memory_turns",
-            0,
-        ),
-        "semantic_memory_status": run.get("metadata", {}).get(
-            "semantic_memory_status"
-        ),
-        "recipe_id": run.get("metadata", {}).get("recipe_id"),
-        "recipe_name": run.get("metadata", {}).get("recipe_name"),
+        "attempted_context_provider": None,
+        "evidence_fallback": False,
+        "evidence_fallback_reason": None,
+        "document": None,
+        "backend": run.get("backend"),
+        "model": run.get("model_label"),
+        "retrieved_chunk_count": 0 if terminal_redaction else len(evidence),
+        "conversation_context_count": run.get("conversation_context_count"),
+        "semantic_memory_count": run.get("semantic_memory_count"),
+        "semantic_memory_status": run.get("semantic_memory_status"),
+        "recipe_id": None,
+        "recipe_name": None,
         "draft_attempt_count": sum(
             1 for step in steps if step.get("phase") == "draft"
         ),
-        "format_check": (
-            format_steps[-1].get("output_summary") if format_steps else None
-        ),
+        "format_check": _public_check_outcome(format_steps[-1]) if format_steps else None,
         "mechanical_check": (
-            mechanical_steps[-1].get("output_summary") if mechanical_steps else None
+            _public_check_outcome(mechanical_steps[-1]) if mechanical_steps else None
         ),
         "verifier": verifier,
         "retry_attempted": retry_attempted,
         "refused": final_decision == "refuse"
         or any(step.get("phase") == "refuse" for step in steps),
         "final_decision": final_decision,
+        "terminal_reason": run.get("terminal_reason"),
         "last_error": public_trace_error(query_result, public_loop_report),
     }
 
@@ -406,6 +447,7 @@ def loop_timeline_dict(query_result: Optional[QueryResult]) -> dict:
         return {
             "rows": [],
             "final_decision": None,
+            "terminal_reason": None,
             "last_error": None,
             "empty": True,
         }
@@ -413,7 +455,6 @@ def loop_timeline_dict(query_result: Optional[QueryResult]) -> dict:
     public_loop_report = public_loop_report_dict(query_result)
     run = (public_loop_report or {}).get("run") or {}
     steps = run.get("steps") or []
-    trace = query_result.trace
     rows = []
 
     if steps:
@@ -425,61 +466,26 @@ def loop_timeline_dict(query_result: Optional[QueryResult]) -> dict:
                     "phase": loop_phase_label(phase),
                     "phase_key": phase,
                     "decision": step.get("decision"),
-                    "step": step.get("name") or loop_phase_label(phase),
+                    "step": loop_phase_label(phase),
                     "signals": loop_step_detail(step),
                 }
             )
     else:
-        fallback_row = 1
         rows.append(
             {
-                "index": fallback_row,
-                "phase": "Context",
-                "phase_key": "context_select",
-                "decision": "continue",
-                "step": trace.document_name or "No active context",
-                "signals": trace.backend,
+                "index": 1,
+                "phase": "Error",
+                "phase_key": "error",
+                "decision": "error",
+                "step": "Trace unavailable",
+                "signals": "No public loop report",
             }
         )
-        fallback_row += 1
-        rows.append(
-            {
-                "index": fallback_row,
-                "phase": "Retrieve",
-                "phase_key": "retrieve",
-                "decision": "continue",
-                "step": "Prompt evidence",
-                "signals": f"{trace.retrieved_chunk_count} chunks",
-            }
-        )
-        fallback_row += 1
-        if trace.self_check:
-            rows.append(
-                {
-                    "index": fallback_row,
-                    "phase": "Check",
-                    "phase_key": "mechanical_check",
-                    "decision": trace.self_check.outcome,
-                    "step": "Self-check",
-                    "signals": ", ".join(trace.self_check.reasons),
-                }
-            )
-            fallback_row += 1
-        if trace.error_message:
-            rows.append(
-                {
-                    "index": fallback_row,
-                    "phase": "Error",
-                    "phase_key": "error",
-                    "decision": "error",
-                    "step": "Query error",
-                    "signals": trace.error_message,
-                }
-            )
 
     return {
         "rows": rows,
         "final_decision": run.get("final_decision"),
+        "terminal_reason": run.get("terminal_reason"),
         "last_error": public_trace_error(query_result, public_loop_report),
         "empty": False,
     }
@@ -502,7 +508,6 @@ def answer_trace_dict(query_result: Optional[QueryResult]) -> dict:
         }
 
     trace = query_result.trace
-    self_check = trace.self_check
     public_loop_report = public_loop_report_dict(query_result)
     terminal_redaction = visible_terminal_redaction_applied(
         query_result,
@@ -517,44 +522,62 @@ def answer_trace_dict(query_result: Optional[QueryResult]) -> dict:
         "refuse",
         "requires_review",
     }
+    run = (public_loop_report or {}).get("run") or {}
+    live_trace_matches = _live_query_result_matches_public_report(
+        query_result,
+        public_loop_report,
+    )
+    bound_model_thinking = _bound_model_thinking(
+        query_result,
+        live_trace_matches=live_trace_matches,
+    )
     question = (
         TERMINAL_PUBLIC_REDACTION
         if terminal_redaction
-        else trace.question
+        else (trace.question if live_trace_matches else None)
     )
-    answer = TERMINAL_PUBLIC_REDACTION if terminal_redaction else query_result.answer
+    answer = public_answer_text(query_result, public_loop_report)
+    evidence = [] if terminal_redaction else run.get("evidence") or []
+    verify_steps = [
+        step for step in run.get("steps") or [] if step.get("phase") == "verify"
+    ]
+    verification = (verify_steps[-1].get("verification") or {}) if verify_steps else {}
     return {
         "question": question,
         "answer": answer,
-        "document": trace.document_name,
-        "backend": trace.backend,
-        "model": trace.model_label,
-        "retrieved_chunk_count": trace.retrieved_chunk_count,
+        "document": None,
+        "backend": run.get("backend"),
+        "model": run.get("model_label"),
+        "retrieved_chunk_count": len(evidence),
         "citations": [
             {
-                "id": citation.citation_id,
-                "source": citation.source_name,
-                "page": citation.page,
+                "id": reference.get("citation_id"),
+                "evidence_id": reference.get("evidence_id"),
+                "provider": reference.get("provider"),
+                "source": reference.get("evidence_id"),
+                "page": (reference.get("locator") or {}).get("page"),
                 "chunk": (
-                    citation.chunk_index + 1
-                    if citation.chunk_index is not None
+                    (reference.get("locator") or {}).get("chunk_index") + 1
+                    if (reference.get("locator") or {}).get("chunk_index") is not None
                     else None
                 ),
-                "excerpt": citation.excerpt,
+                "excerpt": None,
             }
-            for citation in trace.citations
+            for reference in evidence
         ],
         "self_check": (
             {
-                "outcome": self_check.outcome,
-                "reasons": self_check.reasons,
-                "retry_attempted": self_check.retry_attempted,
+                "outcome": verification.get("outcome"),
+                "reasons": [],
+                "retry_attempted": any(
+                    step.get("phase") == "retry" for step in run.get("steps") or []
+                ),
             }
-            if self_check
+            if verification
             else None
         ),
         "model_thinking": model_thinking_dict(
-            trace.model_thinking,
+            bound_model_thinking,
             terminal_redaction=model_thinking_redaction,
         ),
         "loop_report": public_loop_report,
@@ -564,17 +587,188 @@ def answer_trace_dict(query_result: Optional[QueryResult]) -> dict:
 
 def query_response_dict(query_result: QueryResult) -> dict:
     public_loop_report = public_loop_report_dict(query_result)
-    answer = (
-        TERMINAL_PUBLIC_REDACTION
-        if visible_terminal_redaction_applied(query_result, public_loop_report)
-        else query_result.answer
-    )
+    answer = public_answer_text(query_result, public_loop_report)
     return {
         "answer": answer,
         "timeline": loop_timeline_dict(query_result),
         "summary": loop_summary_dict(query_result),
         "trace": answer_trace_dict(query_result),
     }
+
+
+def public_loop_payload_from_report(public_report: Mapping) -> dict:
+    """Rebuild restart UI state solely from a canonical public projection."""
+
+    if not isinstance(public_report, Mapping):
+        raise ValueError("public loop report must be an object")
+    if (
+        public_report.get("projection_schema_version")
+        != PUBLIC_REPORT_PROJECTION_SCHEMA_VERSION
+        or public_report.get("public") is not True
+    ):
+        raise ValueError("unsupported public loop report projection")
+    run = public_report.get("run")
+    if not isinstance(run, Mapping):
+        raise ValueError("public loop report run must be an object")
+    steps = run.get("steps")
+    evidence = run.get("evidence")
+    if not isinstance(steps, list) or not isinstance(evidence, list):
+        raise ValueError("public loop report collections are malformed")
+    if not all(isinstance(step, Mapping) for step in steps):
+        raise ValueError("public loop report step must be an object")
+
+    public_redaction = public_report.get("public_redaction")
+    if not isinstance(public_redaction, Mapping):
+        raise ValueError("public loop report redaction state is malformed")
+    terminal_redaction = bool(public_redaction.get("applied"))
+    answer = public_answer_text_from_report(public_report)
+    verify_steps = [step for step in steps if step.get("phase") == "verify"]
+    verification = (
+        (verify_steps[-1].get("verification") or {}) if verify_steps else {}
+    )
+    format_steps = [step for step in steps if step.get("phase") == "format_check"]
+    mechanical_steps = [
+        step for step in steps if step.get("phase") == "mechanical_check"
+    ]
+    citations = _public_evidence_citations(evidence)
+    public_error = public_trace_error_from_report(public_report)
+    timeline = {
+        "rows": [
+            {
+                "index": index,
+                "phase": loop_phase_label(step.get("phase")),
+                "phase_key": step.get("phase"),
+                "decision": step.get("decision"),
+                "step": loop_phase_label(step.get("phase")),
+                "signals": loop_step_detail(dict(step)),
+            }
+            for index, step in enumerate(steps, start=1)
+        ],
+        "final_decision": run.get("final_decision"),
+        "terminal_reason": run.get("terminal_reason"),
+        "last_error": public_error,
+        "empty": False,
+    }
+    summary = {
+        "context_provider": run.get("context_provider"),
+        "attempted_context_provider": None,
+        "evidence_fallback": False,
+        "evidence_fallback_reason": None,
+        "document": None,
+        "backend": run.get("backend"),
+        "model": run.get("model_label"),
+        "retrieved_chunk_count": len(citations),
+        "conversation_context_count": run.get("conversation_context_count"),
+        "semantic_memory_count": run.get("semantic_memory_count"),
+        "semantic_memory_status": run.get("semantic_memory_status"),
+        "recipe_id": None,
+        "recipe_name": None,
+        "draft_attempt_count": sum(
+            1 for step in steps if step.get("phase") == "draft"
+        ),
+        "format_check": (
+            _public_check_outcome(format_steps[-1]) if format_steps else None
+        ),
+        "mechanical_check": (
+            _public_check_outcome(mechanical_steps[-1])
+            if mechanical_steps
+            else None
+        ),
+        "verifier": (
+            {
+                "decision": verify_steps[-1].get("decision"),
+                "outcome": verification.get("outcome"),
+                "reasons": [],
+            }
+            if verification
+            else None
+        ),
+        "retry_attempted": any(step.get("phase") == "retry" for step in steps),
+        "refused": run.get("final_decision") == "refuse",
+        "final_decision": run.get("final_decision"),
+        "terminal_reason": run.get("terminal_reason"),
+        "last_error": public_error,
+    }
+    trace = {
+        "source": "durable_public_report",
+        "public": True,
+        "question": None,
+        "answer": answer,
+        "document": None,
+        "backend": run.get("backend"),
+        "model": run.get("model_label"),
+        "retrieved_chunk_count": len(citations),
+        "citations": citations,
+        "self_check": (
+            {
+                "outcome": verification.get("outcome"),
+                "reasons": [],
+                "retry_attempted": summary["retry_attempted"],
+            }
+            if verification
+            else None
+        ),
+        "model_thinking": model_thinking_dict(
+            None,
+            terminal_redaction=terminal_redaction,
+        ),
+        "loop_report": dict(public_report),
+        "error": public_error,
+    }
+    return {
+        "answer": answer,
+        "timeline": timeline,
+        "summary": summary,
+        "trace": trace,
+    }
+
+
+def public_answer_text_from_report(public_loop_report: Mapping) -> Optional[str]:
+    if terminal_public_redaction_applied(public_loop_report):
+        if _ordinary_refusal_applied(public_loop_report):
+            return SELF_CHECK_REFUSAL_ANSWER
+        return TERMINAL_PUBLIC_REDACTION
+    run = public_loop_report.get("run")
+    if not isinstance(run, Mapping):
+        return None
+    projected_answer = run.get("final_answer")
+    return projected_answer if isinstance(projected_answer, str) else None
+
+
+def public_trace_error_from_report(public_loop_report: Mapping) -> Optional[str]:
+    if terminal_public_redaction_applied(public_loop_report):
+        if _ordinary_refusal_applied(public_loop_report):
+            return None
+        return PUBLIC_REDACTION_REASON
+    run = public_loop_report.get("run")
+    return (
+        "loop_error"
+        if isinstance(run, Mapping) and run.get("error_present")
+        else None
+    )
+
+
+def _public_evidence_citations(evidence: list) -> list[dict]:
+    citations = []
+    for reference in evidence:
+        if not isinstance(reference, Mapping):
+            raise ValueError("public evidence reference must be an object")
+        locator = reference.get("locator")
+        if not isinstance(locator, Mapping):
+            raise ValueError("public evidence locator must be an object")
+        chunk_index = locator.get("chunk_index")
+        citations.append(
+            {
+                "id": reference.get("citation_id"),
+                "evidence_id": reference.get("evidence_id"),
+                "provider": reference.get("provider"),
+                "source": reference.get("evidence_id"),
+                "page": locator.get("page"),
+                "chunk": chunk_index + 1 if chunk_index is not None else None,
+                "excerpt": None,
+            }
+        )
+    return citations
 
 
 def empty_query_response_dict() -> dict:

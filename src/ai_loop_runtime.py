@@ -88,6 +88,9 @@ except ImportError:
 
 try:
     from .loop_engine import (
+        ANSWER_CANDIDATE_SHA256_METADATA_KEY,
+        EVIDENCE_SET_SHA256_METADATA_KEY,
+        EvidenceReference,
         GuardrailDecision,
         LoopDecision,
         LoopMiddleware,
@@ -97,10 +100,16 @@ try:
         LoopRun,
         LoopSession,
         LoopStep,
+        LoopTerminalReason,
         VerificationResult,
+        answer_candidate_sha256,
+        evidence_set_sha256,
     )
 except ImportError:
     from loop_engine import (
+        ANSWER_CANDIDATE_SHA256_METADATA_KEY,
+        EVIDENCE_SET_SHA256_METADATA_KEY,
+        EvidenceReference,
         GuardrailDecision,
         LoopDecision,
         LoopMiddleware,
@@ -110,7 +119,10 @@ except ImportError:
         LoopRun,
         LoopSession,
         LoopStep,
+        LoopTerminalReason,
         VerificationResult,
+        answer_candidate_sha256,
+        evidence_set_sha256,
     )
 
 try:
@@ -248,6 +260,7 @@ except ImportError:
     from retrieval_types import AnswerCitation, RetrievalChainResult, RetrievedContext
 
 LOGGER = logging.getLogger(__name__)
+MODEL_THINKING_SHA256_METADATA_KEY = "model_thinking_sha256"
 DEFAULT_MAX_SESSION_REPORTS = 200
 DEFAULT_QUALITY_MAX_OUTPUT_TOKENS = 1024
 DEFAULT_FAST_MAX_OUTPUT_TOKENS = 384
@@ -647,8 +660,8 @@ NO_CONTEXT_SELF_CHECK_REASONS = [
     "no_context_provider",
     "verifier_requires_prompt_evidence",
 ]
-DIRECT_STANDALONE_CITATION_MARKER_PATTERN = re.compile(
-    r"(?<!\S)\[(\d+)\](?=$|[\s.,;:!?)])"
+DIRECT_STANDALONE_CITATION_MARKER_PATTERN = (
+    _answer_loop.INLINE_CITATION_MARKER_PATTERN
 )
 
 
@@ -1315,6 +1328,41 @@ class AILoopEngine:
             self.loop_sessions.pop(normalized_session_id, None)
             self._bump_loop_session_revision(normalized_session_id)
 
+    def discard_loop_run(self, session_id: str, run_id: str) -> bool:
+        """Discard one exact unpersisted run and its matching chat entry."""
+
+        normalized_session_id = self._normalize_session_id(session_id)
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return False
+        removed = False
+        with self._session_lock:
+            session = self.loop_sessions.get(normalized_session_id)
+            if session is not None:
+                reports = tuple(
+                    report
+                    for report in session.reports
+                    if report.run.run_id != normalized_run_id
+                )
+                if len(reports) != session.report_count:
+                    self.loop_sessions[normalized_session_id] = replace(
+                        session,
+                        reports=reports,
+                    )
+                    removed = True
+            retained_history = []
+            for entry in self.chat_history:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("session_id") == normalized_session_id
+                    and entry.get("run_id") == normalized_run_id
+                ):
+                    removed = True
+                    continue
+                retained_history.append(entry)
+            self.chat_history[:] = retained_history
+        return removed
+
     def export_loop_session_jsonl(
         self,
         path: str,
@@ -1760,6 +1808,19 @@ class AILoopEngine:
     def _loop_decision_for_self_check(self, self_check: AnswerSelfCheck) -> LoopDecision:
         return _answer_loop.loop_decision_for_self_check(self_check)
 
+    def _loop_step_decision_for_self_check(
+        self,
+        self_check: AnswerSelfCheck,
+    ) -> LoopDecision:
+        decision = self._loop_decision_for_self_check(self_check)
+        if decision == LoopDecision.REFUSE:
+            # A failed check is evidence for the eventual terminal decision,
+            # not itself a terminal refusal. The explicit REFUSE step records
+            # that boundary only if the loop actually stops instead of retrying
+            # or falling back to another context path.
+            return LoopDecision.NOT_VERIFIED
+        return decision
+
     def _format_check_answer(
         self, answer: str, *, retry_attempted: bool = False
     ) -> AnswerFormatCheck:
@@ -1801,7 +1862,37 @@ class AILoopEngine:
         if sanitized_check.outcome != "format_passed":
             return run, None, clean_answer, format_check
 
-        run, guardrail_decision = self._record_loop_step(
+        # Preserve the already-recorded format decision exactly as middleware
+        # observed it. The sanitizer is a new, explicitly linked resolution
+        # step; a flight recorder must never rewrite an earlier event.
+        if len(run.steps) < 2:
+            return run, None, clean_answer, format_check
+        pending_format_step = run.steps[-1]
+        source_draft_step = run.steps[-2]
+        if (
+            pending_format_step.phase != LoopPhase.FORMAT_CHECK
+            or pending_format_step.output_summary != format_check.outcome
+            or pending_format_step.decision != LoopDecision.ERROR
+            or source_draft_step.phase != LoopPhase.DRAFT
+            or source_draft_step.decision != LoopDecision.CONTINUE
+        ):
+            return run, None, clean_answer, format_check
+        sanitized_retry_count = pending_format_step.retry_count
+
+        sanitized_metadata: Dict[str, Any] = {
+            "reasons": list(format_check.reasons),
+            "answer_chars": len(sanitized),
+            "sanitized_internal_labels": True,
+            "sanitized_from_answer_sha256": answer_candidate_sha256(clean_answer),
+            "resolved_format_step_id": pending_format_step.step_id,
+            "format_resolution": "deterministic_format_sanitizer",
+        }
+        evidence_digest = source_draft_step.metadata.get(
+            EVIDENCE_SET_SHA256_METADATA_KEY
+        )
+        if evidence_digest is not None:
+            sanitized_metadata[EVIDENCE_SET_SHA256_METADATA_KEY] = evidence_digest
+        run, guardrail_decision = self._append_loop_step(
             run,
             self._loop_step(
                 LoopPhase.FORMAT_CHECK,
@@ -1809,21 +1900,37 @@ class AILoopEngine:
                 name="Sanitize answer format",
                 input_summary="draft answer",
                 output_summary="format_sanitized",
-                retry_count=1 if format_check.retry_attempted else 0,
-                metadata={
-                    "reasons": list(format_check.reasons),
-                    "answer_chars": len(sanitized),
-                    "sanitized_internal_labels": True,
-                },
+                retry_count=sanitized_retry_count,
+                metadata=self._answer_candidate_metadata(
+                    sanitized,
+                    sanitized_metadata,
+                ),
             ),
         )
         return run, guardrail_decision, sanitized, sanitized_check
 
     def _verification_result_for_self_check(
-        self, self_check: AnswerSelfCheck
+        self,
+        self_check: AnswerSelfCheck,
+        *,
+        verifier_skipped: bool = False,
+        drafter_llm: Optional[object] = None,
     ) -> VerificationResult:
-        return _answer_loop.verification_result_for_self_check(
-            self_check, verifier=self._active_backend()
+        result = _answer_loop.verification_result_for_self_check(
+            self_check,
+            verifier=(None if verifier_skipped else self._active_backend()),
+        )
+        if verifier_skipped:
+            return result
+        return replace(
+            result,
+            verifier_backend=self._active_backend(),
+            verifier_model_label=self._active_model_label(),
+            same_model_as_drafter=(
+                True
+                if drafter_llm is not None and drafter_llm is self.llm
+                else None
+            ),
         )
 
     def _loop_step(
@@ -1896,7 +2003,7 @@ class AILoopEngine:
         retry_count = 1 if retry_attempted else 0
         mechanical_step = self._loop_step(
             LoopPhase.MECHANICAL_CHECK,
-            decision=self._loop_decision_for_self_check(mechanical_check),
+            decision=self._loop_step_decision_for_self_check(mechanical_check),
             name="Mechanical answer checks",
             input_summary="answer plus prompt citations",
             output_summary=mechanical_check.outcome,
@@ -1930,17 +2037,23 @@ class AILoopEngine:
 
         verify_step = self._loop_step(
             LoopPhase.VERIFY,
-            decision=self._loop_decision_for_self_check(self_check),
+            decision=self._loop_step_decision_for_self_check(self_check),
             name="Answer verifier",
             input_summary="answer plus cited excerpts",
             output_summary=self_check.outcome,
             retry_count=retry_count,
-            verification=self._verification_result_for_self_check(self_check),
-            metadata={
-                "reasons": list(self_check.reasons),
-                "citation_count": len(citations),
-                "retry_attempted": retry_attempted,
-            },
+            verification=self._verification_result_for_self_check(
+                self_check,
+                verifier_skipped=self._active_backend() == "mock",
+            ),
+            metadata=self._answer_candidate_metadata(
+                answer,
+                {
+                    "reasons": list(self_check.reasons),
+                    "citation_count": len(citations),
+                    "retry_attempted": retry_attempted,
+                },
+            ),
         )
         return self_check, [mechanical_step, verify_step]
 
@@ -2824,6 +2937,23 @@ class AILoopEngine:
         cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
         return re.sub(r"\s{2,}", " ", cleaned).strip()
 
+    def _normalize_evidence_answer_candidate(
+        self, answer: object
+    ) -> Tuple[str, bool]:
+        """Return the exact evidence-answer candidate recorded by the loop.
+
+        Evidence chains can return an empty or two-character model response. The
+        loop replaces that unusable response with its standard evidence refusal,
+        so the replacement must happen before the draft digest, checks, verifier,
+        and final step are recorded. Otherwise the public projector correctly
+        rejects the report because its visible final answer has no bound draft.
+        """
+
+        clean_answer = str(answer).strip()
+        if len(clean_answer) >= 3:
+            return clean_answer, False
+        return SELF_CHECK_REFUSAL_ANSWER, True
+
     def _draft_direct_answer(
         self,
         question: str,
@@ -2889,6 +3019,11 @@ class AILoopEngine:
                     return
             self.chat_history.append(
                 {
+                    "run_id": (
+                        result.loop_report.run.run_id
+                        if result.loop_report is not None
+                        else None
+                    ),
                     "session_id": session_id,
                     "question": question,
                     "answer": result.answer,
@@ -2970,11 +3105,108 @@ class AILoopEngine:
             },
         )
 
+    def _loop_retry_count(self, run: LoopRun) -> int:
+        return sum(1 for step in run.steps if step.phase == LoopPhase.RETRY)
+
+    def _step_for_current_retry_epoch(
+        self,
+        run: LoopRun,
+        step: LoopStep,
+    ) -> LoopStep:
+        current_retry_count = self._loop_retry_count(run)
+        expected_retry_count = (
+            current_retry_count + 1
+            if step.phase == LoopPhase.RETRY
+            else current_retry_count
+        )
+        if step.retry_count == expected_retry_count:
+            return step
+        # Preserve the preflight identity observed by middleware while making
+        # retry attribution an exact, monotonic epoch across the full suffix.
+        return replace(step, retry_count=expected_retry_count)
+
+    def _with_loop_step(self, run: LoopRun, step: LoopStep) -> LoopRun:
+        return run.with_step(self._step_for_current_retry_epoch(run, step))
+
+    def _answer_candidate_metadata(
+        self,
+        answer: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        evidence: Optional[Sequence[EvidenceReference]] = None,
+    ) -> Dict[str, Any]:
+        result = {
+            **dict(metadata or {}),
+            ANSWER_CANDIDATE_SHA256_METADATA_KEY: answer_candidate_sha256(answer),
+        }
+        if evidence is not None:
+            result[EVIDENCE_SET_SHA256_METADATA_KEY] = evidence_set_sha256(evidence)
+        return result
+
+    def _evidence_references_for_citations(
+        self,
+        *,
+        provider: str,
+        citations: Sequence[AnswerCitation],
+    ) -> Tuple[EvidenceReference, ...]:
+        return tuple(
+            EvidenceReference.from_source(
+                citation_id=citation.citation_id,
+                provider=provider,
+                source_identity=citation.source_name,
+                page=citation.page,
+                chunk_index=citation.chunk_index,
+                excerpt=citation.excerpt,
+            )
+            for citation in citations
+        )
+
+    def _next_loop_retry_count(self, run: LoopRun) -> Optional[int]:
+        retries_used = self._loop_retry_count(run)
+        if retries_used >= run.policy.max_retries:
+            return None
+        return retries_used + 1
+
+    def _retry_step(
+        self,
+        run: LoopRun,
+        *,
+        name: str,
+        output_summary: str,
+        reasons: Sequence[str],
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[Optional[LoopStep], Optional[int]]:
+        retry_count = self._next_loop_retry_count(run)
+        if retry_count is None or not run.steps:
+            return None, None
+        trigger_step = run.steps[-1]
+        return (
+            self._loop_step(
+                LoopPhase.RETRY,
+                decision=LoopDecision.RETRY,
+                name=name,
+                output_summary=output_summary,
+                retry_count=retry_count,
+                metadata={
+                    **dict(metadata or {}),
+                    "reasons": [str(reason) for reason in reasons],
+                    "retry_count": retry_count,
+                    "max_retries": run.policy.max_retries,
+                    "retry_trigger_step_id": trigger_step.step_id,
+                },
+            ),
+            retry_count,
+        )
+
     def _coerce_guardrail_decision(self, decision) -> Optional[GuardrailDecision]:
         if decision is None:
             return None
+        if type(decision) is GuardrailDecision:
+            # Middleware values cross a trust boundary. Reconstruct an exact,
+            # detached snapshot so post-construction mutation cannot smuggle an
+            # invalid decision, review request, or metadata into the raw report.
+            return GuardrailDecision.from_dict(decision.to_dict())
         if isinstance(decision, GuardrailDecision):
-            return decision
+            raise ValueError("middleware guardrail decisions must use the exact type")
         return GuardrailDecision(decision=LoopDecision(decision))
 
     def _run_loop_middleware(
@@ -3003,6 +3235,7 @@ class AILoopEngine:
     def _append_loop_step(
         self, run: LoopRun, step: LoopStep
     ) -> Tuple[LoopRun, Optional[GuardrailDecision]]:
+        step = self._step_for_current_retry_epoch(run, step)
         guardrail_decision = self._prepare_loop_step(run, step)
         if guardrail_decision:
             return run, guardrail_decision
@@ -3017,13 +3250,79 @@ class AILoopEngine:
     def _record_loop_step(
         self, run: LoopRun, step: LoopStep
     ) -> Tuple[LoopRun, Optional[GuardrailDecision]]:
+        step = self._step_for_current_retry_epoch(run, step)
         next_run = run.with_step(step)
         guardrail_decision = self._run_loop_middleware(
             "after_step", next_run, step
         )
-        if guardrail_decision:
+        terminal_step_recorded = step.phase in {
+            LoopPhase.INPUT,
+            LoopPhase.REFUSE,
+            LoopPhase.ERROR,
+            LoopPhase.FINAL,
+        } and step.decision in {
+            LoopDecision.REFUSE,
+            LoopDecision.BLOCK,
+            LoopDecision.REQUIRES_REVIEW,
+        }
+        # A recorded terminal boundary wins over its observer. Failed checks
+        # remain open to middleware, retries, and Smart Evidence fallback.
+        if guardrail_decision and not terminal_step_recorded:
             return next_run, guardrail_decision
         return next_run, None
+
+    def _run_prepared_external_operation(
+        self,
+        *,
+        run: LoopRun,
+        planned_step: LoopStep,
+        operation,
+        error_summary: str,
+    ) -> Tuple[
+        LoopRun,
+        Optional[GuardrailDecision],
+        Any,
+        Optional[Exception],
+    ]:
+        """Run work after ``before_step`` while preserving its trace identity."""
+
+        try:
+            return run, None, operation(), None
+        except Exception as exc:
+            summary = (
+                "web_search_failed"
+                if exc.__class__.__name__ == "WebSearchError"
+                else error_summary
+            )
+            # DRAFT supports an explicit error outcome. Other externally timed
+            # phases use the typed ERROR phase so the public phase/decision
+            # contract stays valid, while retaining the exact planned identity
+            # and start timestamp observed by before_step middleware.
+            failed_step = replace(
+                planned_step,
+                phase=(
+                    LoopPhase.DRAFT
+                    if planned_step.phase == LoopPhase.DRAFT
+                    and exc.__class__.__name__ != "WebSearchError"
+                    else LoopPhase.ERROR
+                ),
+                decision=LoopDecision.ERROR,
+                name=(
+                    "Web search retrieval"
+                    if exc.__class__.__name__ == "WebSearchError"
+                    else planned_step.name
+                ),
+            ).complete(
+                output_summary=summary,
+                error_message=summary,
+                metadata={
+                    "error_type": exc.__class__.__name__,
+                    "planned_phase": planned_step.phase.value,
+                    "reasons": [summary],
+                },
+            )
+            next_run, guardrail_decision = self._record_loop_step(run, failed_step)
+            return next_run, guardrail_decision, None, exc
 
     def _append_loop_steps(
         self, run: LoopRun, steps: List[LoopStep]
@@ -3040,6 +3339,7 @@ class AILoopEngine:
         run: LoopRun,
         answer: str,
         retry_attempted: bool = False,
+        retry_available: bool = True,
     ) -> Tuple[LoopRun, Optional[GuardrailDecision], AnswerFormatCheck]:
         retry_count = 1 if retry_attempted else 0
         planned_format_step = self._planned_loop_step(
@@ -3063,17 +3363,27 @@ class AILoopEngine:
         format_check = self._format_check_answer(
             answer, retry_attempted=retry_attempted
         )
-        format_step = self._loop_step(
-            LoopPhase.FORMAT_CHECK,
-            decision=self._loop_decision_for_format_check(format_check),
-            name="Format check",
-            input_summary="draft answer",
+        format_decision = self._loop_decision_for_format_check(format_check)
+        retry_unavailable = (
+            format_decision == LoopDecision.RETRY and not retry_available
+        )
+        retry_budget_exhausted = (
+            format_decision == LoopDecision.RETRY
+            and self._next_loop_retry_count(run) is None
+        )
+        retry_denied = retry_unavailable or retry_budget_exhausted
+        if retry_denied:
+            format_decision = LoopDecision.ERROR
+        format_step = planned_format_step.complete(
+            decision=format_decision,
             output_summary=format_check.outcome,
-            retry_count=retry_count,
             metadata={
                 "reasons": list(format_check.reasons),
                 "answer_chars": len(str(answer).strip()),
                 "retry_attempted": retry_attempted,
+                "retry_denied": retry_denied,
+                "retry_unavailable": retry_unavailable,
+                "retry_budget_exhausted": retry_budget_exhausted,
             },
         )
         run, guardrail_decision = self._record_loop_step(run, format_step)
@@ -3087,6 +3397,8 @@ class AILoopEngine:
         citations: List[AnswerCitation],
         question: str,
         retry_attempted: bool = False,
+        retry_available: bool = True,
+        drafter_llm: Optional[object] = None,
     ) -> Tuple[LoopRun, Optional[GuardrailDecision], Optional[AnswerSelfCheck]]:
         retry_count = 1 if retry_attempted else 0
         planned_mechanical_step = self._planned_loop_step(
@@ -3105,18 +3417,30 @@ class AILoopEngine:
             question=question,
             retry_attempted=retry_attempted,
         )
-        mechanical_step = self._loop_step(
-            LoopPhase.MECHANICAL_CHECK,
-            decision=self._loop_decision_for_self_check(mechanical_check),
-            name="Mechanical answer checks",
-            input_summary="answer plus prompt citations",
+        mechanical_decision = self._loop_step_decision_for_self_check(
+            mechanical_check
+        )
+        retry_unavailable = (
+            mechanical_decision == LoopDecision.RETRY and not retry_available
+        )
+        retry_budget_exhausted = (
+            mechanical_decision == LoopDecision.RETRY
+            and self._next_loop_retry_count(run) is None
+        )
+        retry_denied = retry_unavailable or retry_budget_exhausted
+        if retry_denied:
+            mechanical_decision = LoopDecision.NOT_VERIFIED
+        mechanical_step = planned_mechanical_step.complete(
+            decision=mechanical_decision,
             output_summary=mechanical_check.outcome,
-            retry_count=retry_count,
             metadata={
                 "reasons": list(mechanical_check.reasons),
                 "citation_count": len(citations),
                 "inline_citation_ids": self._inline_citation_ids(answer),
                 "retry_attempted": retry_attempted,
+                "retry_denied": retry_denied,
+                "retry_unavailable": retry_unavailable,
+                "retry_budget_exhausted": retry_budget_exhausted,
             },
         )
         run, guardrail_decision = self._record_loop_step(run, mechanical_step)
@@ -3150,19 +3474,28 @@ class AILoopEngine:
                 retry_attempted=retry_attempted,
             )
 
-        verify_step = self._loop_step(
-            LoopPhase.VERIFY,
-            decision=self._loop_decision_for_self_check(self_check),
-            name="Answer verifier",
-            input_summary="answer plus cited excerpts",
+        verify_step = replace(
+            planned_verify_step,
+            decision=self._loop_step_decision_for_self_check(self_check),
+            verification=self._verification_result_for_self_check(
+                self_check,
+                verifier_skipped=self._active_backend() == "mock",
+                drafter_llm=drafter_llm,
+            ),
+        ).complete(
             output_summary=self_check.outcome,
-            retry_count=retry_count,
-            verification=self._verification_result_for_self_check(self_check),
-            metadata={
-                "reasons": list(self_check.reasons),
-                "citation_count": len(citations),
-                "retry_attempted": retry_attempted,
-            },
+            metadata=self._answer_candidate_metadata(
+                answer,
+                {
+                    "reasons": list(self_check.reasons),
+                    "citation_count": len(citations),
+                    "retry_attempted": retry_attempted,
+                },
+                evidence=self._evidence_references_for_citations(
+                    provider=run.context_provider,
+                    citations=citations,
+                ),
+            ),
         )
         run, guardrail_decision = self._record_loop_step(run, verify_step)
         return run, guardrail_decision, self_check
@@ -3188,20 +3521,59 @@ class AILoopEngine:
             return "guardrail_retry_unavailable"
         return decision.reason or decision.decision.value
 
-    def _guardrail_step(self, decision: GuardrailDecision) -> LoopStep:
-        return self._loop_step(
+    def _default_terminal_reason(
+        self, final_decision: LoopDecision
+    ) -> LoopTerminalReason:
+        if final_decision in {LoopDecision.SUPPORTED, LoopDecision.FINAL}:
+            return LoopTerminalReason.COMPLETED
+        if final_decision == LoopDecision.NOT_VERIFIED:
+            return LoopTerminalReason.NOT_VERIFIED
+        if final_decision == LoopDecision.REFUSE:
+            return LoopTerminalReason.VERIFICATION_FAILED
+        if final_decision == LoopDecision.REQUIRES_REVIEW:
+            return LoopTerminalReason.HUMAN_REVIEW_REQUIRED
+        if final_decision in {LoopDecision.BLOCK, LoopDecision.RETRY}:
+            return LoopTerminalReason.BLOCKED
+        return LoopTerminalReason.ERROR
+
+    def _terminal_reason_for_guardrail(
+        self, decision: GuardrailDecision
+    ) -> LoopTerminalReason:
+        if decision.decision == LoopDecision.REQUIRES_REVIEW:
+            return LoopTerminalReason.HUMAN_REVIEW_REQUIRED
+        if decision.decision == LoopDecision.REFUSE:
+            return LoopTerminalReason.POLICY_REFUSED
+        return LoopTerminalReason.BLOCKED
+
+    def _guardrail_step(
+        self,
+        decision: GuardrailDecision,
+        *,
+        retry_count: int,
+    ) -> LoopStep:
+        planned_step = self._planned_loop_step(
             LoopPhase.ERROR,
             decision=decision.decision,
             name="Guardrail decision",
-            output_summary=decision.reason or decision.decision.value,
             error_message=decision.reason,
-            human_review=decision.human_review,
+            retry_count=retry_count,
             metadata={
+                **dict(decision.metadata),
                 "guardrail_decision": decision.decision.value,
                 "guardrail_reason": decision.reason,
-                **dict(decision.metadata),
             },
         )
+        human_review = decision.human_review
+        if human_review is not None:
+            human_review = replace(
+                human_review,
+                requested_by_step_id=planned_step.step_id,
+                created_at=planned_step.started_at,
+            )
+        return replace(
+            planned_step,
+            human_review=human_review,
+        ).complete(output_summary=decision.reason or decision.decision.value)
 
     def _finish_loop_report(
         self,
@@ -3209,6 +3581,7 @@ class AILoopEngine:
         run: LoopRun,
         answer: str,
         final_decision: LoopDecision,
+        terminal_reason: Optional[LoopTerminalReason] = None,
         error_message: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[
@@ -3218,43 +3591,94 @@ class AILoopEngine:
         Optional[str],
         Optional[GuardrailDecision],
     ]:
+        terminal_reason = terminal_reason or self._default_terminal_reason(
+            final_decision
+        )
+        terminal_decision_fixed = final_decision in {
+            LoopDecision.REFUSE,
+            LoopDecision.BLOCK,
+            LoopDecision.REQUIRES_REVIEW,
+        }
         applied_guardrail_decision = None
+        completion_metadata = self._answer_candidate_metadata(answer, metadata)
+        final_human_review = None
+        if final_decision == LoopDecision.REQUIRES_REVIEW:
+            final_human_review = next(
+                (
+                    step.human_review
+                    for step in reversed(run.steps)
+                    if step.human_review is not None
+                ),
+                None,
+            )
         final_step = self._loop_step(
             LoopPhase.FINAL,
             decision=final_decision,
             name="Final answer",
             output_summary=final_decision.value,
+            retry_count=self._loop_retry_count(run),
             error_message=error_message,
-            metadata=metadata or {},
+            human_review=final_human_review,
+            metadata=completion_metadata,
         )
-        run, guardrail_decision = self._append_loop_step(run, final_step)
+        if terminal_decision_fixed:
+            # Record the existing terminal outcome without giving final-step
+            # middleware another chance to replace its causal decision.
+            run = self._with_loop_step(run, final_step)
+            guardrail_decision = None
+        else:
+            run, guardrail_decision = self._append_loop_step(run, final_step)
         if guardrail_decision:
             applied_guardrail_decision = guardrail_decision
             answer = self._guardrail_answer(guardrail_decision)
             final_decision = self._terminal_decision_for_guardrail(
                 guardrail_decision
             )
+            terminal_reason = self._terminal_reason_for_guardrail(
+                guardrail_decision
+            )
             error_message = self._error_message_for_guardrail(guardrail_decision)
-            run = run.with_step(self._guardrail_step(guardrail_decision))
+            run = self._with_loop_step(
+                run,
+                self._guardrail_step(
+                    guardrail_decision,
+                    retry_count=self._loop_retry_count(run),
+                ),
+            )
 
         completed_run = run.complete(
             final_decision=final_decision,
+            terminal_reason=terminal_reason,
             final_answer=answer,
             error_message=error_message,
-            metadata=metadata or {},
+            metadata=completion_metadata,
         )
-        after_run_decision = self._run_loop_middleware("after_run", completed_run)
-        if after_run_decision:
+        after_run_decision = (
+            None
+            if applied_guardrail_decision is not None
+            else self._run_loop_middleware("after_run", completed_run)
+        )
+        # after_run may observe a prior refusal, block, or review request, but
+        # its return value cannot rewrite that already-recorded boundary.
+        if after_run_decision and not terminal_decision_fixed:
             applied_guardrail_decision = after_run_decision
             answer = self._guardrail_answer(after_run_decision)
             final_decision = self._terminal_decision_for_guardrail(
                 after_run_decision
             )
+            terminal_reason = self._terminal_reason_for_guardrail(
+                after_run_decision
+            )
             error_message = self._error_message_for_guardrail(after_run_decision)
-            completed_run = completed_run.with_step(
-                self._guardrail_step(after_run_decision)
+            completed_run = self._with_loop_step(
+                completed_run,
+                self._guardrail_step(
+                    after_run_decision,
+                    retry_count=self._loop_retry_count(completed_run),
+                ),
             ).complete(
                 final_decision=final_decision,
+                terminal_reason=terminal_reason,
                 final_answer=answer,
                 error_message=error_message,
                 metadata={
@@ -3278,6 +3702,7 @@ class AILoopEngine:
         active_state: ActiveDocumentState,
         run: LoopRun,
         final_decision: LoopDecision,
+        terminal_reason: Optional[LoopTerminalReason] = None,
         retrieved_chunk_count: int = 0,
         citations: Optional[List[AnswerCitation]] = None,
         self_check: Optional[AnswerSelfCheck] = None,
@@ -3285,6 +3710,25 @@ class AILoopEngine:
         metadata: Optional[Dict[str, Any]] = None,
         model_thinking: Optional[str] = None,
     ) -> QueryResult:
+        answer = str(answer).strip()
+        final_citations = citations or []
+        final_evidence = self._evidence_references_for_citations(
+            provider=run.context_provider,
+            citations=final_citations,
+        )
+        run = run.with_evidence(final_evidence)
+        run_metadata = dict(run.metadata)
+        run_metadata.pop(MODEL_THINKING_SHA256_METADATA_KEY, None)
+        completion_metadata = dict(metadata or {})
+        completion_metadata.pop(MODEL_THINKING_SHA256_METADATA_KEY, None)
+        completion_metadata[EVIDENCE_SET_SHA256_METADATA_KEY] = evidence_set_sha256(
+            final_evidence
+        )
+        if isinstance(model_thinking, str) and model_thinking.strip():
+            run_metadata[MODEL_THINKING_SHA256_METADATA_KEY] = hashlib.sha256(
+                model_thinking.encode("utf-8")
+            ).hexdigest()
+        run = replace(run, metadata=run_metadata)
         (
             loop_report,
             answer,
@@ -3295,8 +3739,9 @@ class AILoopEngine:
             run=run,
             answer=answer,
             final_decision=final_decision,
+            terminal_reason=terminal_reason,
             error_message=error_message,
-            metadata=metadata,
+            metadata=completion_metadata,
         )
         if applied_guardrail_decision:
             retrieved_chunk_count = 0
@@ -3325,13 +3770,20 @@ class AILoopEngine:
         active_state: ActiveDocumentState,
         run: LoopRun,
     ) -> QueryResult:
-        run = run.with_step(self._guardrail_step(decision))
+        run = self._with_loop_step(
+            run,
+            self._guardrail_step(
+                decision,
+                retry_count=self._loop_retry_count(run),
+            ),
+        )
         return self._finish_query_result(
             answer=self._guardrail_answer(decision),
             question=question,
             active_state=active_state,
             run=run,
             final_decision=self._terminal_decision_for_guardrail(decision),
+            terminal_reason=self._terminal_reason_for_guardrail(decision),
             error_message=self._error_message_for_guardrail(decision),
             metadata={"guardrail_decision": decision.decision.value},
         )
@@ -3343,8 +3795,10 @@ class AILoopEngine:
         question: str,
         active_state: ActiveDocumentState,
         run: LoopRun,
+        terminal_reason: LoopTerminalReason = LoopTerminalReason.ERROR,
     ) -> QueryResult:
-        run = run.with_step(
+        run = self._with_loop_step(
+            run,
             self._loop_step(
                 LoopPhase.ERROR,
                 decision=LoopDecision.ERROR,
@@ -3355,7 +3809,7 @@ class AILoopEngine:
                     "reasons": list(format_check.reasons),
                     "retry_attempted": format_check.retry_attempted,
                 },
-            )
+            ),
         )
         return self._finish_query_result(
             answer=FORMAT_CHECK_FAILURE_ANSWER,
@@ -3363,6 +3817,7 @@ class AILoopEngine:
             active_state=active_state,
             run=run,
             final_decision=LoopDecision.ERROR,
+            terminal_reason=terminal_reason,
             error_message="format_check_failed",
             metadata={
                 "format_check_outcome": format_check.outcome,
@@ -3426,6 +3881,37 @@ class AILoopEngine:
                 "fallback_error": "direct_fallback_failed",
             },
         )
+        retry_count = self._loop_retry_count(safe_run)
+        if retry_count:
+            last_retry_index = max(
+                index
+                for index, step in enumerate(safe_run.steps)
+                if step.phase == LoopPhase.RETRY
+            )
+            retry_has_draft_attempt = any(
+                step.phase == LoopPhase.DRAFT
+                for step in safe_run.steps[last_retry_index + 1 :]
+            )
+            if not retry_has_draft_attempt:
+                safe_run = self._with_loop_step(
+                    safe_run,
+                    self._loop_step(
+                        LoopPhase.DRAFT,
+                        decision=LoopDecision.ERROR,
+                        name="Draft direct fallback answer",
+                        input_summary=question,
+                        output_summary="[redacted: failed evidence fallback]",
+                        retry_count=retry_count,
+                        error_message="direct_fallback_failed",
+                        metadata={
+                            "attempted_context_provider": "web",
+                            "context_provider": "none",
+                            "evidence_fallback": True,
+                            "evidence_fallback_reason": fallback_reason,
+                            "output_redacted": True,
+                        },
+                    ),
+                )
         error_metadata: Dict[str, Any] = {
             "error_type": fallback_exc.__class__.__name__,
             "requested_context_provider": requested_context_provider,
@@ -3439,7 +3925,8 @@ class AILoopEngine:
             error_metadata["source_self_check_reasons"] = list(
                 source_self_check.reasons
             )
-        safe_run = safe_run.with_step(
+        safe_run = self._with_loop_step(
+            safe_run,
             self._loop_step(
                 LoopPhase.ERROR,
                 decision=LoopDecision.ERROR,
@@ -3447,7 +3934,7 @@ class AILoopEngine:
                 output_summary="direct_fallback_failed",
                 error_message="direct_fallback_failed",
                 metadata=error_metadata,
-            )
+            ),
         )
         return self._finish_query_result(
             answer=(
@@ -3527,6 +4014,7 @@ class AILoopEngine:
         session_revision: Tuple[int, int],
         source_self_check: Optional[AnswerSelfCheck] = None,
     ) -> QueryResult:
+        fallback_retry_count = self._loop_retry_count(run)
         fallback_metadata = {
             **dict(run.metadata),
             "context_provider": "none",
@@ -3573,6 +4061,7 @@ class AILoopEngine:
             LoopPhase.DRAFT,
             name="Draft direct fallback answer",
             input_summary=question,
+            retry_count=fallback_retry_count,
         )
         guardrail_decision = self._prepare_loop_step(run, planned_draft_step)
         if guardrail_decision:
@@ -3583,17 +4072,42 @@ class AILoopEngine:
                 run=run,
             )
 
+        run, guardrail_decision, draft_result, draft_error = (
+            self._run_prepared_external_operation(
+                run=run,
+                planned_step=planned_draft_step,
+                operation=lambda: self._draft_direct_answer(
+                    question,
+                    conversation_history=conversation_context,
+                    semantic_memory=semantic_memory_context,
+                    loop_recipe=loop_recipe_context,
+                ),
+                error_summary="direct_fallback_failed",
+            )
+        )
+        if guardrail_decision:
+            return self._finish_guardrail_query_result(
+                decision=guardrail_decision,
+                question=question,
+                active_state=active_state,
+                run=run,
+            )
+        if draft_error is not None:
+            return self._finish_failed_smart_web_direct_fallback(
+                run=run,
+                question=question,
+                active_state=active_state,
+                requested_context_provider=requested_context_provider,
+                fallback_reason=fallback_reason,
+                fallback_exc=draft_error,
+                source_self_check=source_self_check,
+            )
         (
             raw_response,
             response,
             model_thinking,
             removed_inline_citation_ids,
-        ) = self._draft_direct_answer(
-            question,
-            conversation_history=conversation_context,
-            semantic_memory=semantic_memory_context,
-            loop_recipe=loop_recipe_context,
-        )
+        ) = draft_result
         if len(response) < 3:
             model_thinking = None
             error_metadata = {
@@ -3607,11 +4121,8 @@ class AILoopEngine:
             }
             run, guardrail_decision = self._record_loop_step(
                 run,
-                self._loop_step(
-                    LoopPhase.DRAFT,
+                planned_draft_step.complete(
                     decision=LoopDecision.ERROR,
-                    name="Draft direct fallback answer",
-                    input_summary=question,
                     output_summary="empty_direct_answer",
                     error_message="empty_direct_answer",
                     metadata=error_metadata,
@@ -3655,13 +4166,13 @@ class AILoopEngine:
             draft_metadata["model_thinking_chars"] = len(model_thinking)
         run, guardrail_decision = self._record_loop_step(
             run,
-            self._loop_step(
-                LoopPhase.DRAFT,
-                decision=LoopDecision.CONTINUE,
-                name="Draft direct fallback answer",
-                input_summary=question,
+            planned_draft_step.complete(
                 output_summary=str(response).strip()[:500],
-                metadata=draft_metadata,
+                metadata=self._answer_candidate_metadata(
+                    response,
+                    draft_metadata,
+                    evidence=(),
+                ),
             ),
         )
         if guardrail_decision:
@@ -3675,6 +4186,7 @@ class AILoopEngine:
         run, guardrail_decision, format_check = self._run_format_check_with_loop(
             run=run,
             answer=response,
+            retry_attempted=fallback_retry_count > 0,
         )
         if guardrail_decision:
             return self._finish_guardrail_query_result(
@@ -3708,6 +4220,11 @@ class AILoopEngine:
                 question=question,
                 active_state=active_state,
                 run=safe_run,
+                terminal_reason=(
+                    LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                    if fallback_retry_count >= run.policy.max_retries
+                    else LoopTerminalReason.ERROR
+                ),
             )
 
         self_check = AnswerSelfCheck(
@@ -3716,7 +4233,7 @@ class AILoopEngine:
                 *NO_CONTEXT_SELF_CHECK_REASONS,
                 "smart_web_evidence_fallback",
             ],
-            retry_attempted=False,
+            retry_attempted=fallback_retry_count > 0,
         )
         verify_step = self._loop_step(
             LoopPhase.VERIFY,
@@ -3724,17 +4241,25 @@ class AILoopEngine:
             name="No-context verification boundary",
             input_summary="fallback answer without prompt evidence",
             output_summary=self_check.outcome,
-            verification=self._verification_result_for_self_check(self_check),
-            metadata={
-                "reasons": list(self_check.reasons),
-                "citation_count": 0,
-                "retry_attempted": False,
-                "verifier_skipped": True,
-                "attempted_context_provider": "web",
-                "evidence_fallback_reason": fallback_reason,
-            },
+            retry_count=fallback_retry_count,
+            verification=self._verification_result_for_self_check(
+                self_check,
+                verifier_skipped=True,
+            ),
+            metadata=self._answer_candidate_metadata(
+                response,
+                {
+                    "reasons": list(self_check.reasons),
+                    "citation_count": 0,
+                    "retry_attempted": fallback_retry_count > 0,
+                    "verifier_skipped": True,
+                    "attempted_context_provider": "web",
+                    "evidence_fallback_reason": fallback_reason,
+                },
+                evidence=(),
+            ),
         )
-        run, guardrail_decision = self._record_loop_step(run, verify_step)
+        run, guardrail_decision = self._append_loop_step(run, verify_step)
         if guardrail_decision:
             return self._finish_guardrail_query_result(
                 decision=guardrail_decision,
@@ -3759,7 +4284,9 @@ class AILoopEngine:
                 "evidence_fallback": True,
                 "evidence_fallback_reason": fallback_reason,
                 "self_check_outcome": self_check.outcome,
-                "retry_attempted": False,
+                "retry_attempted": fallback_retry_count > 0,
+                "retries_used": fallback_retry_count,
+                "max_retries": run.policy.max_retries,
                 "recipe_id": (
                     loop_recipe_context["recipe_id"] if loop_recipe_context else None
                 ),
@@ -3798,6 +4325,10 @@ class AILoopEngine:
         semantic_memory_status = self._normalize_semantic_memory_status(
             semantic_memory_status
         )
+        if semantic_memory_context:
+            semantic_memory_status = "retrieved"
+        elif semantic_memory_status == "retrieved":
+            semantic_memory_status = "empty"
         loop_recipe_context = self._normalize_loop_recipe(loop_recipe)
         try:
             requested_context_provider = self._normalize_query_context_provider(
@@ -3816,7 +4347,8 @@ class AILoopEngine:
                 semantic_memory_status=semantic_memory_status,
                 loop_recipe=loop_recipe_context,
             )
-            run = run.with_step(
+            run = self._with_loop_step(
+                run,
                 self._loop_step(
                     LoopPhase.INPUT,
                     decision=LoopDecision.BLOCK,
@@ -3824,7 +4356,7 @@ class AILoopEngine:
                     output_summary="invalid_context_provider",
                     error_message="invalid_context_provider",
                     metadata={"error_type": exc.__class__.__name__},
-                )
+                ),
             )
             return self._finish_query_result(
                 answer=(
@@ -4088,6 +4620,8 @@ class AILoopEngine:
         )
 
         direct_context = context_retrieval_chain is None
+        retry_budget_exhausted = False
+        terminal_reason_override: Optional[LoopTerminalReason] = None
         try:
             if direct_context:
                 planned_draft_step = self._planned_loop_step(
@@ -4103,17 +4637,34 @@ class AILoopEngine:
                         active_state=active_state,
                         run=run,
                     )
+                run, guardrail_decision, draft_result, draft_error = (
+                    self._run_prepared_external_operation(
+                        run=run,
+                        planned_step=planned_draft_step,
+                        operation=lambda: self._draft_direct_answer(
+                            clean_prompt,
+                            conversation_history=conversation_context,
+                            semantic_memory=semantic_memory_context,
+                            loop_recipe=loop_recipe_context,
+                        ),
+                        error_summary="direct_draft_failed",
+                    )
+                )
+                if guardrail_decision:
+                    return self._finish_guardrail_query_result(
+                        decision=guardrail_decision,
+                        question=clean_prompt,
+                        active_state=active_state,
+                        run=run,
+                    )
+                if draft_error is not None:
+                    raise draft_error
                 (
                     raw_response,
                     response,
                     model_thinking,
                     removed_inline_citation_ids,
-                ) = self._draft_direct_answer(
-                    clean_prompt,
-                    conversation_history=conversation_context,
-                    semantic_memory=semantic_memory_context,
-                    loop_recipe=loop_recipe_context,
-                )
+                ) = draft_result
                 if len(response) < 3:
                     model_thinking = None
                     error_metadata = {
@@ -4124,11 +4675,8 @@ class AILoopEngine:
                     }
                     run, guardrail_decision = self._record_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.DRAFT,
+                        planned_draft_step.complete(
                             decision=LoopDecision.ERROR,
-                            name="Draft direct answer",
-                            input_summary=clean_prompt,
                             output_summary="empty_direct_answer",
                             error_message="empty_direct_answer",
                             metadata=error_metadata,
@@ -4173,13 +4721,16 @@ class AILoopEngine:
                     draft_metadata["model_thinking_chars"] = len(model_thinking)
                 run, guardrail_decision = self._record_loop_step(
                     run,
-                    self._loop_step(
-                        LoopPhase.DRAFT,
-                        decision=LoopDecision.CONTINUE,
-                        name="Draft direct answer",
-                        input_summary=clean_prompt,
+                    planned_draft_step.complete(
                         output_summary=str(response).strip()[:500],
-                        metadata=draft_metadata,
+                        metadata=self._answer_candidate_metadata(
+                            str(response),
+                            draft_metadata,
+                            evidence=self._evidence_references_for_citations(
+                                provider=run.context_provider,
+                                citations=citations,
+                            ),
+                        ),
                     ),
                 )
                 if guardrail_decision:
@@ -4201,17 +4752,28 @@ class AILoopEngine:
                         question=clean_prompt,
                         active_state=active_state,
                         run=run,
-                    )
+                )
                 if format_check.outcome == "needs_retry":
+                    retry_step, retry_count = self._retry_step(
+                        run,
+                        name="Retry answer format",
+                        output_summary="retrying after format check",
+                        reasons=format_check.reasons,
+                        metadata={"retry_reason": "format_check"},
+                    )
+                    if retry_step is None or retry_count is None:
+                        return self._finish_format_check_failed_query_result(
+                            format_check=format_check,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                            terminal_reason=(
+                                LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                            ),
+                        )
                     run, guardrail_decision = self._append_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.RETRY,
-                            decision=LoopDecision.RETRY,
-                            name="Retry answer format",
-                            output_summary="retrying after format check",
-                            metadata={"reasons": list(format_check.reasons)},
-                        ),
+                        retry_step,
                     )
                     if guardrail_decision:
                         return self._finish_guardrail_query_result(
@@ -4224,7 +4786,7 @@ class AILoopEngine:
                         LoopPhase.DRAFT,
                         name="Draft format retry answer",
                         input_summary=clean_prompt,
-                        retry_count=1,
+                        retry_count=retry_count,
                     )
                     guardrail_decision = self._prepare_loop_step(
                         run, planned_retry_draft_step
@@ -4236,20 +4798,37 @@ class AILoopEngine:
                             active_state=active_state,
                             run=run,
                         )
+                    run, guardrail_decision, retry_draft_result, retry_draft_error = (
+                        self._run_prepared_external_operation(
+                            run=run,
+                            planned_step=planned_retry_draft_step,
+                            operation=lambda: self._draft_direct_answer(
+                                clean_prompt,
+                                conversation_history=conversation_context,
+                                semantic_memory=semantic_memory_context,
+                                loop_recipe=loop_recipe_context,
+                                format_instruction=(
+                                    self._format_check_retry_instruction(format_check)
+                                ),
+                            ),
+                            error_summary="direct_retry_draft_failed",
+                        )
+                    )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    if retry_draft_error is not None:
+                        raise retry_draft_error
                     (
                         raw_response,
                         response,
                         model_thinking,
                         removed_inline_citation_ids,
-                    ) = self._draft_direct_answer(
-                        clean_prompt,
-                        conversation_history=conversation_context,
-                        semantic_memory=semantic_memory_context,
-                        loop_recipe=loop_recipe_context,
-                        format_instruction=self._format_check_retry_instruction(
-                            format_check
-                        ),
-                    )
+                    ) = retry_draft_result
                     if len(response) < 3:
                         model_thinking = None
                         error_metadata = {
@@ -4261,13 +4840,9 @@ class AILoopEngine:
                         }
                         run, guardrail_decision = self._record_loop_step(
                             run,
-                            self._loop_step(
-                                LoopPhase.DRAFT,
+                            planned_retry_draft_step.complete(
                                 decision=LoopDecision.ERROR,
-                                name="Draft format retry answer",
-                                input_summary=clean_prompt,
                                 output_summary="empty_direct_answer",
-                                retry_count=1,
                                 error_message="empty_direct_answer",
                                 metadata=error_metadata,
                             ),
@@ -4309,14 +4884,16 @@ class AILoopEngine:
                         )
                     run, guardrail_decision = self._record_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.DRAFT,
-                            decision=LoopDecision.CONTINUE,
-                            name="Draft format retry answer",
-                            input_summary=clean_prompt,
+                        planned_retry_draft_step.complete(
                             output_summary=str(response).strip()[:500],
-                            retry_count=1,
-                            metadata=retry_draft_metadata,
+                            metadata=self._answer_candidate_metadata(
+                                str(response),
+                                retry_draft_metadata,
+                                evidence=self._evidence_references_for_citations(
+                                    provider=run.context_provider,
+                                    citations=citations,
+                                ),
+                            ),
                         ),
                     )
                     if guardrail_decision:
@@ -4364,24 +4941,38 @@ class AILoopEngine:
                             question=clean_prompt,
                             active_state=active_state,
                             run=run,
+                            terminal_reason=(
+                                LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                            ),
                         )
+                no_context_retry_count = self._loop_retry_count(run)
+                self_check = replace(
+                    self_check,
+                    retry_attempted=no_context_retry_count > 0,
+                )
                 verify_step = self._loop_step(
                     LoopPhase.VERIFY,
                     decision=LoopDecision.NOT_VERIFIED,
                     name="No-context verification boundary",
                     input_summary="answer without prompt evidence",
                     output_summary=self_check.outcome,
+                    retry_count=no_context_retry_count,
                     verification=self._verification_result_for_self_check(
-                        self_check
+                        self_check,
+                        verifier_skipped=True,
                     ),
-                    metadata={
-                        "reasons": list(self_check.reasons),
-                        "citation_count": 0,
-                        "retry_attempted": False,
-                        "verifier_skipped": True,
-                    },
+                    metadata=self._answer_candidate_metadata(
+                        response,
+                        {
+                            "reasons": list(self_check.reasons),
+                            "citation_count": 0,
+                            "retry_attempted": no_context_retry_count > 0,
+                            "verifier_skipped": True,
+                        },
+                        evidence=(),
+                    ),
                 )
-                run, guardrail_decision = self._record_loop_step(run, verify_step)
+                run, guardrail_decision = self._append_loop_step(run, verify_step)
                 if guardrail_decision:
                     return self._finish_guardrail_query_result(
                         decision=guardrail_decision,
@@ -4394,34 +4985,48 @@ class AILoopEngine:
                     hasattr(context_retrieval_chain, "retrieve_with_trace")
                     and hasattr(context_retrieval_chain, "draft_with_trace")
                 )
-                planned_retrieve_step = self._planned_loop_step(
-                    LoopPhase.RETRIEVE,
-                    name="Retrieve prompt evidence",
-                    input_summary=clean_prompt,
-                )
-                guardrail_decision = self._prepare_loop_step(
-                    run, planned_retrieve_step
-                )
-                if guardrail_decision:
-                    return self._finish_guardrail_query_result(
-                        decision=guardrail_decision,
-                        question=clean_prompt,
-                        active_state=active_state,
-                        run=run,
-                    )
                 if supports_split_trace:
-                    retrieved_context = context_retrieval_chain.retrieve_with_trace(
-                        provider_query_prompt
+                    planned_retrieve_step = self._planned_loop_step(
+                        LoopPhase.RETRIEVE,
+                        name="Retrieve prompt evidence",
+                        input_summary=clean_prompt,
                     )
+                    guardrail_decision = self._prepare_loop_step(
+                        run, planned_retrieve_step
+                    )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    run, guardrail_decision, retrieved_context, retrieve_error = (
+                        self._run_prepared_external_operation(
+                            run=run,
+                            planned_step=planned_retrieve_step,
+                            operation=lambda: (
+                                context_retrieval_chain.retrieve_with_trace(
+                                    provider_query_prompt
+                                )
+                            ),
+                            error_summary="retrieval_failed",
+                        )
+                    )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    if retrieve_error is not None:
+                        raise retrieve_error
                     retrieved_chunk_count = retrieved_context.retrieved_chunk_count
                     citations = retrieved_context.citations
                     run, guardrail_decision = self._record_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.RETRIEVE,
-                            decision=LoopDecision.CONTINUE,
-                            name="Retrieve prompt evidence",
-                            input_summary=clean_prompt,
+                        planned_retrieve_step.complete(
                             output_summary=(f"{retrieved_chunk_count} prompt chunks"),
                             metadata={
                                 "retrieved_chunk_count": retrieved_chunk_count,
@@ -4454,11 +5059,65 @@ class AILoopEngine:
                             active_state=active_state,
                             run=run,
                         )
-                    chain_result = context_retrieval_chain.draft_with_trace(
-                        draft_prompt,
-                        retrieved_context,
+                    run, guardrail_decision, chain_result, draft_error = (
+                        self._run_prepared_external_operation(
+                            run=run,
+                            planned_step=planned_draft_step,
+                            operation=lambda: context_retrieval_chain.draft_with_trace(
+                                draft_prompt,
+                                retrieved_context,
+                            ),
+                            error_summary="draft_failed",
+                        )
                     )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    if draft_error is not None:
+                        raise draft_error
                 else:
+                    # A legacy combined chain cannot expose retrieval and drafting
+                    # as independently timed operations. Record the retrieval
+                    # guardrail boundary before invoking it, then time the combined
+                    # external call on the draft step below. This keeps every
+                    # middleware-observed planned step correlated without inventing
+                    # overlapping sequential spans.
+                    planned_retrieve_step = self._planned_loop_step(
+                        LoopPhase.RETRIEVE,
+                        name="Authorize combined prompt retrieval",
+                        input_summary=clean_prompt,
+                    )
+                    guardrail_decision = self._prepare_loop_step(
+                        run, planned_retrieve_step
+                    )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    run, guardrail_decision = self._record_loop_step(
+                        run,
+                        planned_retrieve_step.complete(
+                            output_summary="combined retrieval delegated to draft",
+                            metadata={
+                                "combined_retrieve_and_draft": True,
+                                "retrieval_deferred_to_draft": True,
+                            },
+                        ),
+                    )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
                     planned_draft_step = self._planned_loop_step(
                         LoopPhase.DRAFT,
                         name="Draft answer",
@@ -4474,18 +5133,40 @@ class AILoopEngine:
                             active_state=active_state,
                             run=run,
                         )
-                    chain_result = context_retrieval_chain.invoke_with_trace(
-                        provider_query_prompt
+                    run, guardrail_decision, chain_result, draft_error = (
+                        self._run_prepared_external_operation(
+                            run=run,
+                            planned_step=planned_draft_step,
+                            operation=lambda: context_retrieval_chain.invoke_with_trace(
+                                provider_query_prompt
+                            ),
+                            error_summary="combined_retrieve_and_draft_failed",
+                        )
                     )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    if draft_error is not None:
+                        raise draft_error
                     retrieved_chunk_count = chain_result.retrieved_chunk_count
                     citations = chain_result.citations
 
-                response = chain_result.answer
+                # Normalize the candidate once before it is recorded, checked,
+                # verified, and eventually emitted. Binding digests then cover
+                # the exact bytes every downstream loop phase sees.
+                response, short_answer_normalized = (
+                    self._normalize_evidence_answer_candidate(chain_result.answer)
+                )
                 retrieved_chunk_count = chain_result.retrieved_chunk_count
                 citations = chain_result.citations
                 model_thinking = getattr(chain_result, "model_thinking", None)
                 draft_metadata = {
                     "answer_chars": len(str(response).strip()),
+                    "short_answer_normalized": short_answer_normalized,
                     "inline_citation_ids": self._inline_citation_ids(str(response)),
                     "model_thinking_available": bool(model_thinking),
                 }
@@ -4506,13 +5187,16 @@ class AILoopEngine:
                     )
                 run, guardrail_decision = self._record_loop_step(
                     run,
-                    self._loop_step(
-                        LoopPhase.DRAFT,
-                        decision=LoopDecision.CONTINUE,
-                        name="Draft answer",
-                        input_summary=clean_prompt,
+                    planned_draft_step.complete(
                         output_summary=str(response).strip()[:500],
-                        metadata=draft_metadata,
+                        metadata=self._answer_candidate_metadata(
+                            str(response),
+                            draft_metadata,
+                            evidence=self._evidence_references_for_citations(
+                                provider=run.context_provider,
+                                citations=citations,
+                            ),
+                        ),
                     ),
                 )
                 if guardrail_decision:
@@ -4526,6 +5210,10 @@ class AILoopEngine:
                     self._run_format_check_with_loop(
                         run=run,
                         answer=response,
+                        retry_available=hasattr(
+                            context_retrieval_chain,
+                            "retry_with_trace",
+                        ),
                     )
                 )
                 if guardrail_decision:
@@ -4538,15 +5226,26 @@ class AILoopEngine:
                 if format_check.outcome == "needs_retry" and hasattr(
                     context_retrieval_chain, "retry_with_trace"
                 ):
+                    retry_step, retry_count = self._retry_step(
+                        run,
+                        name="Retry answer format",
+                        output_summary="retrying after format check",
+                        reasons=format_check.reasons,
+                        metadata={"retry_reason": "format_check"},
+                    )
+                    if retry_step is None or retry_count is None:
+                        return self._finish_format_check_failed_query_result(
+                            format_check=format_check,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                            terminal_reason=(
+                                LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                            ),
+                        )
                     run, guardrail_decision = self._append_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.RETRY,
-                            decision=LoopDecision.RETRY,
-                            name="Retry answer format",
-                            output_summary="retrying after format check",
-                            metadata={"reasons": list(format_check.reasons)},
-                        ),
+                        retry_step,
                     )
                     if guardrail_decision:
                         return self._finish_guardrail_query_result(
@@ -4559,7 +5258,7 @@ class AILoopEngine:
                         LoopPhase.DRAFT,
                         name="Draft format retry answer",
                         input_summary=clean_prompt,
-                        retry_count=1,
+                        retry_count=retry_count,
                     )
                     guardrail_decision = self._prepare_loop_step(
                         run, planned_retry_draft_step
@@ -4571,15 +5270,35 @@ class AILoopEngine:
                             active_state=active_state,
                             run=run,
                         )
-                    retry_result = context_retrieval_chain.retry_with_trace(
-                        draft_prompt,
-                        chain_result,
-                        self_check_instruction=self._format_check_retry_instruction(
-                            format_check
-                        ),
+                    run, guardrail_decision, retry_result, retry_draft_error = (
+                        self._run_prepared_external_operation(
+                            run=run,
+                            planned_step=planned_retry_draft_step,
+                            operation=lambda: context_retrieval_chain.retry_with_trace(
+                                draft_prompt,
+                                chain_result,
+                                self_check_instruction=(
+                                    self._format_check_retry_instruction(format_check)
+                                ),
+                            ),
+                            error_summary="format_retry_draft_failed",
+                        )
                     )
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    if retry_draft_error is not None:
+                        raise retry_draft_error
                     chain_result = retry_result
-                    response = retry_result.answer
+                    response, short_answer_normalized = (
+                        self._normalize_evidence_answer_candidate(
+                            retry_result.answer
+                        )
+                    )
                     retrieved_chunk_count = retry_result.retrieved_chunk_count
                     citations = retry_result.citations
                     model_thinking = getattr(retry_result, "model_thinking", None)
@@ -4590,6 +5309,7 @@ class AILoopEngine:
                         ),
                         "model_thinking_available": bool(model_thinking),
                         "retry_reason": "format_check",
+                        "short_answer_normalized": short_answer_normalized,
                     }
                     if model_thinking:
                         retry_draft_metadata["model_thinking_chars"] = len(
@@ -4597,14 +5317,16 @@ class AILoopEngine:
                         )
                     run, guardrail_decision = self._record_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.DRAFT,
-                            decision=LoopDecision.CONTINUE,
-                            name="Draft format retry answer",
-                            input_summary=clean_prompt,
+                        planned_retry_draft_step.complete(
                             output_summary=str(response).strip()[:500],
-                            retry_count=1,
-                            metadata=retry_draft_metadata,
+                            metadata=self._answer_candidate_metadata(
+                                str(response),
+                                retry_draft_metadata,
+                                evidence=self._evidence_references_for_citations(
+                                    provider=run.context_provider,
+                                    citations=citations,
+                                ),
+                            ),
                         ),
                     )
                     if guardrail_decision:
@@ -4652,12 +5374,24 @@ class AILoopEngine:
                         question=clean_prompt,
                         active_state=active_state,
                         run=run,
+                        terminal_reason=(
+                            LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                            if self._loop_retry_count(run)
+                            >= run.policy.max_retries
+                            else LoopTerminalReason.ERROR
+                        ),
                     )
                 run, guardrail_decision, self_check = self._run_self_check_with_loop(
                     run=run,
                     answer=response,
                     citations=citations,
                     question=effective_prompt,
+                    retry_attempted=self._loop_retry_count(run) > 0,
+                    retry_available=hasattr(
+                        context_retrieval_chain,
+                        "retry_with_trace",
+                    ),
+                    drafter_llm=getattr(context_retrieval_chain, "llm", None),
                 )
                 if guardrail_decision:
                     return self._finish_guardrail_query_result(
@@ -4674,27 +5408,39 @@ class AILoopEngine:
                 retry_web_verifier_failure = (
                     context_provider_type == "web"
                     and self._should_retry_web_verifier_failure(self_check)
+                    and not self._smart_web_can_fallback_to_direct(
+                        requested_context_provider
+                    )
                 )
-                if (
+                retry_requested = (
                     self_check.outcome == "needs_retry"
                     or retry_web_verifier_failure
-                ) and hasattr(context_retrieval_chain, "retry_with_trace"):
+                ) and hasattr(context_retrieval_chain, "retry_with_trace")
+                if retry_requested and self._next_loop_retry_count(run) is None:
+                    retry_budget_exhausted = True
+                if retry_requested and not retry_budget_exhausted:
+                    retry_step, retry_count = self._retry_step(
+                        run,
+                        name="Retry answer",
+                        output_summary=(
+                            "retrying after web verifier failure"
+                            if retry_web_verifier_failure
+                            else "retrying after self-check failure"
+                        ),
+                        reasons=self_check.reasons,
+                        metadata={
+                            "context_provider": context_provider_type,
+                            "retry_reason": (
+                                "web_verifier"
+                                if retry_web_verifier_failure
+                                else "self_check"
+                            ),
+                        },
+                    )
+                    assert retry_step is not None and retry_count is not None
                     run, guardrail_decision = self._append_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.RETRY,
-                            decision=LoopDecision.RETRY,
-                            name="Retry answer",
-                            output_summary=(
-                                "retrying after web verifier failure"
-                                if retry_web_verifier_failure
-                                else "retrying after self-check failure"
-                            ),
-                            metadata={
-                                "reasons": list(self_check.reasons),
-                                "context_provider": context_provider_type,
-                            },
-                        ),
+                        retry_step,
                     )
                     if guardrail_decision:
                         return self._finish_guardrail_query_result(
@@ -4707,7 +5453,7 @@ class AILoopEngine:
                         LoopPhase.DRAFT,
                         name="Draft retry answer",
                         input_summary=clean_prompt,
-                        retry_count=1,
+                        retry_count=retry_count,
                     )
                     guardrail_decision = self._prepare_loop_step(
                         run, planned_retry_draft_step
@@ -4719,16 +5465,36 @@ class AILoopEngine:
                             active_state=active_state,
                             run=run,
                         )
-                    retry_result = context_retrieval_chain.retry_with_trace(
-                        draft_prompt,
-                        chain_result,
-                        self_check_instruction=(
-                            self._web_evidence_retry_instruction(self_check)
-                            if retry_web_verifier_failure
-                            else self._self_check_retry_instruction(self_check)
-                        ),
+                    run, guardrail_decision, retry_result, retry_draft_error = (
+                        self._run_prepared_external_operation(
+                            run=run,
+                            planned_step=planned_retry_draft_step,
+                            operation=lambda: context_retrieval_chain.retry_with_trace(
+                                draft_prompt,
+                                chain_result,
+                                self_check_instruction=(
+                                    self._web_evidence_retry_instruction(self_check)
+                                    if retry_web_verifier_failure
+                                    else self._self_check_retry_instruction(self_check)
+                                ),
+                            ),
+                            error_summary="retry_draft_failed",
+                        )
                     )
-                    response = retry_result.answer
+                    if guardrail_decision:
+                        return self._finish_guardrail_query_result(
+                            decision=guardrail_decision,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            run=run,
+                        )
+                    if retry_draft_error is not None:
+                        raise retry_draft_error
+                    response, short_answer_normalized = (
+                        self._normalize_evidence_answer_candidate(
+                            retry_result.answer
+                        )
+                    )
                     retrieved_chunk_count = retry_result.retrieved_chunk_count
                     citations = retry_result.citations
                     model_thinking = getattr(retry_result, "model_thinking", None)
@@ -4738,6 +5504,7 @@ class AILoopEngine:
                             str(response)
                         ),
                         "model_thinking_available": bool(model_thinking),
+                        "short_answer_normalized": short_answer_normalized,
                     }
                     if model_thinking:
                         retry_draft_metadata["model_thinking_chars"] = len(
@@ -4745,14 +5512,16 @@ class AILoopEngine:
                         )
                     run, guardrail_decision = self._record_loop_step(
                         run,
-                        self._loop_step(
-                            LoopPhase.DRAFT,
-                            decision=LoopDecision.CONTINUE,
-                            name="Draft retry answer",
-                            input_summary=clean_prompt,
+                        planned_retry_draft_step.complete(
                             output_summary=str(response).strip()[:500],
-                            retry_count=1,
-                            metadata=retry_draft_metadata,
+                            metadata=self._answer_candidate_metadata(
+                                str(response),
+                                retry_draft_metadata,
+                                evidence=self._evidence_references_for_citations(
+                                    provider=run.context_provider,
+                                    citations=citations,
+                                ),
+                            ),
                         ),
                     )
                     if guardrail_decision:
@@ -4800,6 +5569,9 @@ class AILoopEngine:
                             question=clean_prompt,
                             active_state=active_state,
                             run=run,
+                            terminal_reason=(
+                                LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                            ),
                         )
                     (
                         run,
@@ -4811,6 +5583,12 @@ class AILoopEngine:
                         citations=citations,
                         question=effective_prompt,
                         retry_attempted=True,
+                        retry_available=True,
+                        drafter_llm=getattr(
+                            context_retrieval_chain,
+                            "llm",
+                            None,
+                        ),
                     )
                     if guardrail_decision:
                         return self._finish_guardrail_query_result(
@@ -4839,20 +5617,62 @@ class AILoopEngine:
                         active_state=active_state,
                         run=run,
                     )
-                response = context_retrieval_chain.invoke(provider_query_prompt)
+                run, guardrail_decision, raw_untraced_result, draft_error = (
+                    self._run_prepared_external_operation(
+                        run=run,
+                        planned_step=planned_draft_step,
+                        operation=lambda: context_retrieval_chain.invoke(
+                            provider_query_prompt
+                        ),
+                        error_summary="untraced_draft_failed",
+                    )
+                )
+                if guardrail_decision:
+                    return self._finish_guardrail_query_result(
+                        decision=guardrail_decision,
+                        question=clean_prompt,
+                        active_state=active_state,
+                        run=run,
+                    )
+                if draft_error is not None:
+                    raise draft_error
+                raw_untraced_response = str(raw_untraced_result)
+                removed_inline_citation_ids = self._direct_citation_marker_ids(
+                    raw_untraced_response
+                )
+                response = self._strip_direct_answer_citations(
+                    raw_untraced_response
+                )
+                response, short_answer_normalized = (
+                    self._normalize_evidence_answer_candidate(response)
+                )
                 model_thinking = self._last_model_thinking()
                 retrieved_chunk_count = 0
                 citations = []
-                self_check = None
+                self_check = AnswerSelfCheck(
+                    outcome="not_verified",
+                    reasons=[
+                        "retrieval_trace_unavailable",
+                        "verifier_skipped_without_prompt_evidence",
+                    ],
+                    retry_attempted=False,
+                )
+                terminal_reason_override = LoopTerminalReason.TRACE_UNAVAILABLE
                 run, guardrail_decision = self._record_loop_step(
                     run,
-                    self._loop_step(
-                        LoopPhase.DRAFT,
-                        decision=LoopDecision.CONTINUE,
-                        name="Draft answer",
-                        input_summary=clean_prompt,
+                    planned_draft_step.complete(
                         output_summary=str(response).strip()[:500],
-                        metadata={"trace_available": False},
+                        metadata=self._answer_candidate_metadata(
+                            response,
+                            {
+                                "trace_available": False,
+                                "short_answer_normalized": short_answer_normalized,
+                                "removed_inline_citation_ids": (
+                                    removed_inline_citation_ids
+                                ),
+                            },
+                            evidence=(),
+                        ),
                     ),
                 )
                 if guardrail_decision:
@@ -4866,6 +5686,7 @@ class AILoopEngine:
                     self._run_format_check_with_loop(
                         run=run,
                         answer=str(response),
+                        retry_available=False,
                     )
                 )
                 if guardrail_decision:
@@ -4900,6 +5721,36 @@ class AILoopEngine:
                         active_state=active_state,
                         run=run,
                     )
+                verify_step = self._loop_step(
+                    LoopPhase.VERIFY,
+                    decision=LoopDecision.NOT_VERIFIED,
+                    name="Untraced retrieval verification boundary",
+                    input_summary="answer without prompt evidence trace",
+                    output_summary=self_check.outcome,
+                    verification=self._verification_result_for_self_check(
+                        self_check,
+                        verifier_skipped=True,
+                    ),
+                    metadata=self._answer_candidate_metadata(
+                        response,
+                        {
+                            "reasons": list(self_check.reasons),
+                            "citation_count": 0,
+                            "retry_attempted": False,
+                            "verifier_skipped": True,
+                            "trace_available": False,
+                        },
+                        evidence=(),
+                    ),
+                )
+                run, guardrail_decision = self._append_loop_step(run, verify_step)
+                if guardrail_decision:
+                    return self._finish_guardrail_query_result(
+                        decision=guardrail_decision,
+                        question=clean_prompt,
+                        active_state=active_state,
+                        run=run,
+                    )
 
             response = str(response).strip()
             if len(response) < 3 and not direct_context:
@@ -4909,6 +5760,12 @@ class AILoopEngine:
                     answer=response,
                     citations=citations,
                     question=clean_prompt,
+                    retry_attempted=self._loop_retry_count(run) > 0,
+                    retry_available=hasattr(
+                        context_retrieval_chain,
+                        "retry_with_trace",
+                    ),
+                    drafter_llm=getattr(context_retrieval_chain, "llm", None),
                 )
                 if guardrail_decision:
                     return self._finish_guardrail_query_result(
@@ -4925,25 +5782,53 @@ class AILoopEngine:
 
             if self_check and self_check.outcome not in SELF_CHECK_PASS_OUTCOMES:
                 if (
+                    self_check.outcome == "needs_retry"
+                    and self._next_loop_retry_count(run) is None
+                ):
+                    retry_budget_exhausted = True
+                if (
                     context_provider_type == "web"
                     and self._smart_web_can_fallback_to_direct(
                         requested_context_provider
                     )
                     and self._smart_web_self_check_can_fallback(self_check)
                 ):
-                    return self._run_smart_web_direct_fallback_safely(
-                        run=run,
-                        question=clean_prompt,
-                        active_state=active_state,
-                        requested_context_provider=requested_context_provider,
-                        conversation_context=conversation_context,
-                        semantic_memory_context=semantic_memory_context,
-                        loop_recipe_context=loop_recipe_context,
-                        fallback_reason="web_evidence_not_verified",
-                        session_id=session_id,
-                        session_revision=session_revision,
-                        source_self_check=self_check,
+                    retry_step, _retry_count = self._retry_step(
+                        run,
+                        name="Retry without web evidence",
+                        output_summary="falling back to direct model knowledge",
+                        reasons=self_check.reasons,
+                        metadata={
+                            "context_provider": context_provider_type,
+                            "retry_reason": "smart_web_direct_fallback",
+                        },
                     )
+                    if retry_step is not None:
+                        run, guardrail_decision = self._append_loop_step(
+                            run,
+                            retry_step,
+                        )
+                        if guardrail_decision:
+                            return self._finish_guardrail_query_result(
+                                decision=guardrail_decision,
+                                question=clean_prompt,
+                                active_state=active_state,
+                                run=run,
+                            )
+                        return self._run_smart_web_direct_fallback_safely(
+                            run=run,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            requested_context_provider=requested_context_provider,
+                            conversation_context=conversation_context,
+                            semantic_memory_context=semantic_memory_context,
+                            loop_recipe_context=loop_recipe_context,
+                            fallback_reason="web_evidence_not_verified",
+                            session_id=session_id,
+                            session_revision=session_revision,
+                            source_self_check=self_check,
+                        )
+                    retry_budget_exhausted = True
                 response = SELF_CHECK_REFUSAL_ANSWER
                 if self_check.outcome != "needs_refusal":
                     self_check = self._fail_closed_self_check(self_check)
@@ -4981,6 +5866,11 @@ class AILoopEngine:
                 active_state=active_state,
                 run=run,
                 final_decision=final_decision,
+                terminal_reason=(
+                    LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                    if retry_budget_exhausted
+                    else terminal_reason_override
+                ),
                 retrieved_chunk_count=retrieved_chunk_count,
                 citations=citations,
                 self_check=self_check,
@@ -4991,6 +5881,11 @@ class AILoopEngine:
                     "retry_attempted": (
                         self_check.retry_attempted if self_check else False
                     ),
+                    "retries_used": self._loop_retry_count(run),
+                    "max_retries": run.policy.max_retries,
+                    "retry_denied": retry_budget_exhausted,
+                    "retry_unavailable": False,
+                    "retry_budget_exhausted": retry_budget_exhausted,
                     "recipe_id": (
                         loop_recipe_context["recipe_id"] if loop_recipe_context else None
                     ),
@@ -5013,28 +5908,81 @@ class AILoopEngine:
                 and exc.__class__.__name__ == "WebSearchError"
             ):
                 LOGGER.info("Web search provider failed.")
-                run = run.with_step(
-                    self._loop_step(
-                        LoopPhase.ERROR,
-                        decision=LoopDecision.ERROR,
-                        name="Web search retrieval",
-                        output_summary="web_search_failed",
-                        error_message="web_search_failed",
-                        metadata={"error_type": exc.__class__.__name__},
+                if not (
+                    run.steps
+                    and run.steps[-1].phase == LoopPhase.ERROR
+                    and run.steps[-1].output_summary == "web_search_failed"
+                ):
+                    run = self._with_loop_step(
+                        run,
+                        self._loop_step(
+                            LoopPhase.ERROR,
+                            decision=LoopDecision.ERROR,
+                            name="Web search retrieval",
+                            output_summary="web_search_failed",
+                            error_message="web_search_failed",
+                            metadata={
+                                "error_type": exc.__class__.__name__,
+                                "reasons": ["web_search_failed"],
+                            },
+                        ),
                     )
-                )
                 if self._smart_web_can_fallback_to_direct(requested_context_provider):
-                    return self._run_smart_web_direct_fallback_safely(
-                        run=run,
+                    retry_step, _retry_count = self._retry_step(
+                        run,
+                        name="Retry without web evidence",
+                        output_summary="falling back to direct model knowledge",
+                        reasons=["web_search_failed"],
+                        metadata={
+                            "context_provider": "web",
+                            "retry_reason": "smart_web_direct_fallback",
+                        },
+                    )
+                    if retry_step is not None:
+                        run, guardrail_decision = self._append_loop_step(
+                            run,
+                            retry_step,
+                        )
+                        if guardrail_decision:
+                            return self._finish_guardrail_query_result(
+                                decision=guardrail_decision,
+                                question=clean_prompt,
+                                active_state=active_state,
+                                run=run,
+                            )
+                        return self._run_smart_web_direct_fallback_safely(
+                            run=run,
+                            question=clean_prompt,
+                            active_state=active_state,
+                            requested_context_provider=requested_context_provider,
+                            conversation_context=conversation_context,
+                            semantic_memory_context=semantic_memory_context,
+                            loop_recipe_context=loop_recipe_context,
+                            fallback_reason="web_search_failed",
+                            session_id=session_id,
+                            session_revision=session_revision,
+                        )
+                    return self._finish_query_result(
+                        answer=(
+                            "Web search evidence is unavailable right now. Try again "
+                            "or ask without requiring web evidence."
+                        ),
                         question=clean_prompt,
                         active_state=active_state,
-                        requested_context_provider=requested_context_provider,
-                        conversation_context=conversation_context,
-                        semantic_memory_context=semantic_memory_context,
-                        loop_recipe_context=loop_recipe_context,
-                        fallback_reason="web_search_failed",
-                        session_id=session_id,
-                        session_revision=session_revision,
+                        run=run,
+                        final_decision=LoopDecision.ERROR,
+                        terminal_reason=(
+                            LoopTerminalReason.RETRY_BUDGET_EXHAUSTED
+                        ),
+                        error_message="web_search_failed",
+                        metadata={
+                            "context_provider": run.context_provider,
+                            "retries_used": self._loop_retry_count(run),
+                            "max_retries": run.policy.max_retries,
+                            "retry_denied": True,
+                            "retry_unavailable": False,
+                            "retry_budget_exhausted": True,
+                        },
                     )
                 return self._finish_query_result(
                     answer=(
@@ -5056,7 +6004,8 @@ class AILoopEngine:
                     active_state=active_state,
                     run=run,
                 )
-            run = run.with_step(
+            run = self._with_loop_step(
+                run,
                 self._loop_step(
                     LoopPhase.ERROR,
                     decision=LoopDecision.ERROR,
@@ -5064,7 +6013,7 @@ class AILoopEngine:
                     output_summary="query_failed",
                     error_message="query_failed",
                     metadata={"error_type": exc.__class__.__name__},
-                )
+                ),
             )
             return self._finish_query_result(
                 answer="I hit an internal error while processing your question. Please try again.",
