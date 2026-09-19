@@ -57,7 +57,8 @@ The gated product direction is documented in
 
 ### Prerequisites
 - Python 3.11 or 3.12; Python 3.12 is what CI and Docker use
-- `uv` for the recommended local workflow ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
+- `uv` 0.12.15 or newer for the complete local workflow, including audits
+  ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
 - Ollama installed for the recommended local runtime
 - Optional: an OpenAI-compatible model gateway for cloud or remote deployment
   (`/v1/chat/completions` shape)
@@ -76,16 +77,11 @@ The gated product direction is documented in
 2. Install dependencies with `uv`:
 
     ```bash
-    uv sync --dev
+    uv sync --locked --dev
     ```
 
-   Pip fallback:
-
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
-    python -m pip install -r requirements.txt -r requirements-dev.txt
-    ```
+   uv creates the project environment automatically. `--locked` rejects an
+   outdated lockfile rather than changing dependency versions during setup.
 
 3. Run with Ollama:
 
@@ -105,7 +101,7 @@ The gated product direction is documented in
 
     Edit `.env` if you pulled a different chat or embedding model. The app
     loads `.env` and `.env.local` automatically when started with
-    `uv run loopwright` or `python -m src.app`; shell exports still override
+    `uv run --locked loopwright`; shell exports still override
     file values for one-off runs. Both local files are ignored by git.
 
     `LLM_BACKEND` selects the provider runtime. `LLM_MODEL` chooses the chat
@@ -169,15 +165,9 @@ The gated product direction is documented in
 8. Run the application:
 
     ```bash
-    uv run loopwright
+    uv run --locked loopwright
     ```
 
-    Pip fallback after activating `venv`:
-
-    ```bash
-    python -m src.app
-    ```
-   
 ## 🐳 Docker Setup
 
 The application is containerized for easy deployment.
@@ -408,10 +398,10 @@ Golden evals live in `tests/test_golden_document_eval.py` and the CLI lives in
 JSON artifact that includes the loop reports used to score each case:
 
 ```bash
-uv run python -m src.loop_eval --mode fake --artifact artifacts/loop-eval.json
-uv run pytest tests/test_golden_document_eval.py -q
-uv run pytest tests/test_loop_eval.py -q
-uv run pytest
+uv run --locked python -m src.loop_eval --mode fake --artifact artifacts/loop-eval.json
+uv run --locked pytest tests/test_golden_document_eval.py -q
+uv run --locked pytest tests/test_loop_eval.py -q
+uv run --locked pytest
 ```
 
 Use these before adding planner loops, tools, multi-context memory, or more
@@ -461,12 +451,12 @@ more sensitive.
 Use the local export CLI when starting from a JSONL session artifact:
 
 ```bash
-uv run python -m src.loop_export \
+uv run --locked python -m src.loop_export \
   --adapter openai-trace \
   --input artifacts/loop-session-default.jsonl \
   --output artifacts/openai-trace.json
 
-uv run python -m src.loop_export \
+uv run --locked python -m src.loop_export \
   --adapter langgraph-manifest \
   --input artifacts/loop-session-default.jsonl \
   --output artifacts/langgraph-manifest.json
@@ -498,8 +488,8 @@ developer diagnostics because they may include prompts, retrieved excerpts,
 draft outputs, and final answers. Planned inspect/diff commands should look like:
 
 ```bash
-uv run python -m src.loop_replay inspect artifacts/loop-session-default.jsonl
-uv run python -m src.loop_replay diff before.jsonl after.jsonl
+uv run --locked python -m src.loop_replay inspect artifacts/loop-session-default.jsonl
+uv run --locked python -m src.loop_replay diff before.jsonl after.jsonl
 ```
 
 Those commands are intentionally not implemented yet. The report and public
@@ -518,7 +508,7 @@ only accepts loopback Ollama URLs such as
 remote model benchmark tool.
 
 ```bash
-uv run python -m src.loop_eval \
+uv run --locked python -m src.loop_eval \
   --mode ollama \
   --models nemotron-3-nano:4b \
   --case launch_date \
@@ -530,7 +520,7 @@ uv run python -m src.loop_eval \
 Then run the full golden set for one model:
 
 ```bash
-uv run python -m src.loop_eval \
+uv run --locked python -m src.loop_eval \
   --mode ollama \
   --models nemotron-3-nano:4b \
   --all-cases \
@@ -549,7 +539,7 @@ override when you have enough free unified memory and are comfortable watching
 resource pressure:
 
 ```bash
-uv run python -m src.loop_eval \
+uv run --locked python -m src.loop_eval \
   --mode ollama \
   --models nemotron-3-nano:4b qwen3:8b \
   --allow-multi-model \
@@ -569,15 +559,22 @@ ollama stop qwen3:8b
 ```
 
 ## Security and Dependency Maintenance
-- Dependencies are declared in `pyproject.toml` and locked in `uv.lock` for the
-  recommended local workflow.
-- `requirements.txt` and `requirements-dev.txt` remain locked, third-party-only
-  pip-compatible exports for Docker and conservative CI/deployment paths. Tests
-  guard their generation mode and direct-dependency coverage alongside the
-  `pyproject.toml`/`uv.lock` consistency check.
-- Dependabot is enabled weekly (`.github/dependabot.yml`) for dependency updates.
-- The current lock resolves FastAPI `0.139.0`, Uvicorn `0.51.0`, FAISS CPU
-  `1.14.3`, LangChain Core `1.4.9`, `langchain-text-splitters` `1.1.2`, local
+- Dependencies are declared in `pyproject.toml` and locked in `uv.lock`.
+  Local setup, CI, and Docker all install with `uv sync --locked`; requirements
+  exports are no longer maintained. Docker installs runtime dependencies only
+  and runs the installed app without resolving dependencies at startup.
+- Add dependencies with `uv add`, or `uv add --dev` for development tools. Update
+  an existing dependency with `uv lock --upgrade-package PACKAGE`, then run
+  `uv sync --locked --dev` and the checks below. Commit `pyproject.toml` and
+  `uv.lock` together when both change.
+- Dependabot uses its uv ecosystem for weekly dependency updates.
+- Audits use [`uv audit`](https://docs.astral.sh/uv/reference/cli/#uv-audit)
+  directly against the lockfile. That command is currently experimental, so CI
+  and Docker pin uv to 0.12.15. There is no project-wide uv version floor, so
+  Dependabot can update the lockfile with its bundled uv. Use 0.12.15 or newer
+  for local audits. Audit failures remain blocking; no intermediate requirements
+  export is needed.
+- The runtime uses FastAPI, Uvicorn, FAISS CPU, LangChain components, local
   text/document parsers, and the stdlib-HTTP Ollama/OpenAI-compatible model
   adapters. Treat `uv.lock` as the exact baseline; lower bounds remain in
   `pyproject.toml`.
@@ -587,17 +584,15 @@ ollama stop qwen3:8b
 - Recommended recurring checks:
 
   ```bash
-  uv sync --dev
+  uv sync --locked --dev
   uv lock --check
-  uv run pytest tests/test_loop_engine.py -q
-  uv run pytest tests/test_golden_document_eval.py -q
-  uv run pytest tests/test_loop_eval.py -q
-  uv run pytest tests/test_ollama_model_eval.py -q
-  uv run pytest
-  uv export --locked --no-dev --no-emit-project --no-hashes \
-    -o /tmp/loopwright-audit-requirements.txt
-  uv run pip-audit -r /tmp/loopwright-audit-requirements.txt --strict
-  uv run python -m pip check
+  uv run --locked pytest tests/test_loop_engine.py -q
+  uv run --locked pytest tests/test_golden_document_eval.py -q
+  uv run --locked pytest tests/test_loop_eval.py -q
+  uv run --locked pytest tests/test_ollama_model_eval.py -q
+  uv run --locked pytest
+  uv audit --locked --no-dev
+  uv pip check
   ```
 
 ## Agent-Assisted Development

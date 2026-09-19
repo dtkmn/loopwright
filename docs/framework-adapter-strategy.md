@@ -279,14 +279,10 @@ src/adapters/
 tests/test_microsoft_workflow_events_adapter.py
 ```
 
-Optional live integrations should be dependency-gated later:
-
-```text
-requirements-adapters.txt
-```
-
-or Python extras if packaging is introduced. Do not add these dependencies to
-`requirements.txt`.
+Optional live integrations should be dependency-gated later through optional
+extras in `pyproject.toml`, resolved in `uv.lock`, and installed explicitly with
+`uv sync --locked --extra NAME`. Do not add framework SDKs to core dependencies
+or introduce separate requirements files.
 
 ## Decision
 

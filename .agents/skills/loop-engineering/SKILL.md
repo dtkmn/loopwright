@@ -155,9 +155,9 @@ the whole product boundary.
 - Explicit encoding selections are user intent. Preserve valid CP1250, CP1251,
   CP1252, CP1254, CP1257, Latin-1, UTF-8, UTF-16, and UTF-32 behavior when
   touching text ingestion.
-- `pyproject.toml` is the local-development dependency contract. Keep
-  `requirements.txt` and `requirements-dev.txt` synchronized as pip-compatible
-  deployment exports.
+- `pyproject.toml` and `uv.lock` are the dependency contract for local development,
+  CI, and Docker. Install with `uv sync --locked`; do not restore requirements
+  exports or pip installation paths. Audit with `uv audit --locked --no-dev`.
 
 ## Files To Inspect First
 
@@ -186,8 +186,7 @@ the whole product boundary.
 - `src/loop_export.py`
 - `docs/framework-adapter-strategy.md`
 - `pyproject.toml`
-- `requirements.txt`
-- `requirements-dev.txt`
+- `uv.lock`
 - `tests/test_document_qa.py`
 - `tests/test_app.py`
 - `tests/test_golden_document_eval.py`
@@ -201,7 +200,7 @@ the whole product boundary.
 
 For ingestion or encoding changes:
 
-- `python -m pytest tests/test_document_qa.py -q`
+- `uv run --locked python -m pytest tests/test_document_qa.py -q`
 - Include replacement-failure tests that prove the previous document remains
   active and queryable.
 - Add hostile tests for env pollution, mojibake, invalid bytes, or unsupported
@@ -209,7 +208,7 @@ For ingestion or encoding changes:
 
 For UI status changes:
 
-- `python -m pytest tests/test_app.py -q`
+- `uv run --locked python -m pytest tests/test_app.py -q`
 - Confirm mock mode and real backend wording remain honest.
 
 For backend routing changes:
@@ -226,15 +225,15 @@ For backend routing changes:
 For answer-loop or agent-pattern changes:
 
 - `uv lock --check` when packaging metadata or dependency files changed.
-- `python -m pytest tests/test_loop_engine.py -q`
-- `python -m pytest tests/test_golden_document_eval.py -q`
-- `python -m pytest tests/test_loop_eval.py -q`
-- `python -m pytest tests/test_ollama_model_eval.py -q`
-- `python -m pytest tests/test_openai_trace_adapter.py -q` when adapter export
+- `uv run --locked python -m pytest tests/test_loop_engine.py -q`
+- `uv run --locked python -m pytest tests/test_golden_document_eval.py -q`
+- `uv run --locked python -m pytest tests/test_loop_eval.py -q`
+- `uv run --locked python -m pytest tests/test_ollama_model_eval.py -q`
+- `uv run --locked python -m pytest tests/test_openai_trace_adapter.py -q` when adapter export
   behavior changes.
-- `python -m pytest tests/test_langgraph_manifest_adapter.py -q` when LangGraph
+- `uv run --locked python -m pytest tests/test_langgraph_manifest_adapter.py -q` when LangGraph
   manifest behavior changes.
-- `python -m pytest tests/test_loop_export.py -q` when JSONL adapter export CLI
+- `uv run --locked python -m pytest tests/test_loop_export.py -q` when JSONL adapter export CLI
   behavior changes.
 - Assert cited supported answers, unsupported-answer refusal, and retry behavior.
 - Keep eval fixtures deterministic and provider-free.

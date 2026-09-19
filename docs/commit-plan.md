@@ -1,5 +1,9 @@
 # Commit plan for the pending Loopwright update
 
+Historical record: these changes were merged before the uv-only migration.
+The file groups and validation commands below describe that earlier update;
+use the current README for dependency setup and maintenance.
+
 This plan includes the existing staged work and the fixes from the September
 2026 readiness review. Apply the commits in order. No commit or push is performed
 by this document.

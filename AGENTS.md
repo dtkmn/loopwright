@@ -78,15 +78,12 @@ Primary runtime files:
 
 ## Setup Commands
 
-- Install local dependencies: `uv sync --dev`
-- Pip fallback: `python -m pip install -r requirements.txt -r requirements-dev.txt`
-- Run the app locally: `uv run loopwright` or `python -m src.app`
-- Run tests: `uv run pytest` or `python -m pytest`
-- Compile check: `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/public_projection.py src/loop_eval.py src/ollama_model_eval.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_ollama_model_eval.py tests/test_packaging_metadata.py tests/test_thread_store.py`
-- Dependency checks: `python -m pip check`; then export the locked third-party
-  set with `uv export --no-hashes --no-dev --no-emit-project --locked -o
-  /tmp/loopwright-third-party-requirements.txt` and run `python -m pip_audit -r
-  /tmp/loopwright-third-party-requirements.txt --strict`
+- Install local dependencies: `uv sync --locked --dev`
+- Run the app locally: `uv run --locked loopwright`
+- Run tests: `uv run --locked pytest`
+- Compile check: `uv run --locked python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/public_projection.py src/loop_eval.py src/ollama_model_eval.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_ollama_model_eval.py tests/test_packaging_metadata.py tests/test_thread_store.py`
+- Dependency checks: `uv lock --check`, `uv pip check`, and
+  `uv audit --locked --no-dev`.
 
 ## Non-Negotiable Contracts
 
@@ -227,10 +224,13 @@ Primary runtime files:
 - `src.loop_export` must default to the public artifact projection. Raw export
   is a local diagnostics path and must require an explicit `--raw` flag. Treat
   every exported artifact as potentially sensitive.
-- `pyproject.toml` is the project metadata and local-development dependency
-  contract. Keep `requirements.txt` and `requirements-dev.txt` as pip-compatible
-  exports for deployment compatibility, and keep them synchronized with
-  `pyproject.toml`.
+- `pyproject.toml` and `uv.lock` are the dependency contract for local development,
+  CI, and Docker. Use `uv sync --locked` for installation and `uv run --locked`
+  for project commands. Do not restore requirements exports or pip installation
+  paths. Audit the locked runtime dependencies with `uv audit --locked --no-dev`.
+  Keep uv pinned consistently in CI and Docker. Do not add a project-wide uv
+  version floor that excludes Dependabot's bundled updater; local audits need
+  the version documented in the README.
 
 ## Engineering Loop
 
@@ -283,18 +283,18 @@ For narrow docs-only changes:
 
 For Python behavior changes:
 
-- `uv run pytest` or `python -m pytest`
-- `uv run pytest tests/test_golden_document_eval.py -q`
-- `uv run pytest tests/test_loop_eval.py -q`
-- `uv run pytest tests/test_openai_trace_adapter.py -q`
-- `uv run pytest tests/test_langgraph_manifest_adapter.py -q`
-- `uv run pytest tests/test_loop_export.py -q`
+- `uv run --locked pytest`
+- `uv run --locked pytest tests/test_golden_document_eval.py -q`
+- `uv run --locked pytest tests/test_loop_eval.py -q`
+- `uv run --locked pytest tests/test_openai_trace_adapter.py -q`
+- `uv run --locked pytest tests/test_langgraph_manifest_adapter.py -q`
+- `uv run --locked pytest tests/test_loop_export.py -q`
 - `uv lock --check`
-- `python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/public_projection.py src/loop_eval.py src/loop_export.py src/ollama_model_eval.py src/adapters/__init__.py src/adapters/base.py src/adapters/redaction.py src/adapters/openai_trace.py src/adapters/langgraph_manifest.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_loop_export.py tests/test_ollama_model_eval.py tests/test_openai_trace_adapter.py tests/test_langgraph_manifest_adapter.py tests/test_packaging_metadata.py tests/test_thread_store.py`
-- `python -m pip check`
+- `uv run --locked python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/public_projection.py src/loop_eval.py src/loop_export.py src/ollama_model_eval.py src/adapters/__init__.py src/adapters/base.py src/adapters/redaction.py src/adapters/openai_trace.py src/adapters/langgraph_manifest.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_loop_export.py tests/test_ollama_model_eval.py tests/test_openai_trace_adapter.py tests/test_langgraph_manifest_adapter.py tests/test_packaging_metadata.py tests/test_thread_store.py`
+- `uv pip check`
 
 For dependency or security-sensitive changes:
 
-- `python -m pip install --dry-run -r requirements.txt`
-- `uv export --no-hashes --no-dev --no-emit-project --locked -o /tmp/loopwright-third-party-requirements.txt`
-- `uv run python -m pip_audit -r /tmp/loopwright-third-party-requirements.txt --strict`
+- `uv sync --locked --dev`
+- `uv audit --locked --no-dev`
+- Build the Docker image and smoke-test the installed app when packaging changes.
