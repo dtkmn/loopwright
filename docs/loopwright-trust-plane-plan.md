@@ -23,13 +23,15 @@ versioned public run records, and local raw JSONL export. Evidence-backed routes
 retrieve, draft, mechanically check, verify, and may retry or refuse. Direct
 routes draft without retrieved evidence and finish `not_verified`. A single
 allowlist-only `loop-public-report/v1` projector supplies web responses,
-durable history, adapters, and the export CLI. It also exports OpenAI
+durable history, adapters, the export CLI, and offline session inspection.
+`src.loop_replay inspect` reads raw session JSONL into readable summaries or
+versioned JSON, using the public projection by default. It also exports OpenAI
 trace-shaped JSON and LangGraph manifest JSON; those export modules do not
 import or execute the target framework runtimes.
 
 It does not yet provide:
 
-- `inspect` or semantic `diff` commands for session artifacts;
+- semantic `diff` commands for session artifacts;
 - deterministic re-execution replay;
 - inbound Codex or Claude trace normalization;
 - Microsoft workflow-event export;
@@ -38,7 +40,7 @@ It does not yet provide:
 
 The plan keeps those distinctions explicit.
 
-## Delivery Status (2026-07-17)
+## Delivery Status (2026-09-20)
 
 The initial implementation tranche has completed the claims truth pass, the
 runtime retry/termination portion of Week 1, the narrow historical public-run
@@ -48,9 +50,10 @@ constructed completed reports may retain an `unspecified` terminal reason.
 The public boundary is now `loop-public-report/v1`: a versioned allowlist rather
 than a raw-report copy with selective redaction. Hostile tests cover terminal
 contradictions, identity mismatch, legacy re-projection, and malformed-record
-quarantine. Week 3 remains blocked until this tranche passes the full validation
-suite and is merge-ready; external trace ingestion remains blocked behind that
-gate.
+quarantine. That baseline passed full validation and was merged. The inspection
+portion of Week 3 is now implemented locally: public summaries, explicit raw
+diagnostics, JSON output, run selection, and exact input-line errors. Semantic
+diff remains pending; external trace ingestion remains behind the Week 3 gate.
 
 ## Success Metric
 
@@ -76,9 +79,8 @@ Deliverables:
   marked future direction.
 - Use **Loop Recipes**, not “skills”; recipes do not grant tools, scheduling, or
   autonomous action.
-- Describe JSONL as a local session or diagnostic artifact and future
-  inspect/diff input. Do not present inspection, diffing, or re-execution as
-  implemented.
+- Describe JSONL as a local session or diagnostic artifact with offline
+  inspection. Keep semantic diff and re-execution explicitly planned.
 - Keep Microsoft workflow-event export explicitly planned.
 - Say that evidence makes unsupported behavior harder—but not impossible—to
   fake.
@@ -149,8 +151,8 @@ Deliverables:
 Acceptance gate: every fixture run reopens with the same intentionally
 projected public evidence and terminal decision after restart, while raw
 content remains unavailable from the public report surface by default. This
-gate is implemented and covered by focused hostile fixtures. It is not a merge
-approval: Week 3 stays closed until the whole tranche passes full validation.
+gate is implemented and covered by focused hostile fixtures. The baseline
+tranche passed full validation and was merged before Week 3 inspection began.
 
 The projection is a data-minimization boundary, not authentication, access
 control, or a general PII/secret scrub. Thread messages remain raw local data,
@@ -164,8 +166,9 @@ is artifact inspection and comparison, not deterministic model re-execution.
 
 Deliverables:
 
-- Add `src.loop_replay inspect <session.jsonl>` for readable run summaries.
-- Add `src.loop_replay diff <before.jsonl> <after.jsonl>` for semantic changes.
+- Implemented: `src.loop_replay inspect <session.jsonl>` for readable run
+  summaries, `--format json`, and `--report-index` selection.
+- Pending: `src.loop_replay diff <before.jsonl> <after.jsonl>` for semantic changes.
 - Compare phases, decisions, evidence identity, retry behavior, verification,
   model and configuration metadata, timing, and terminal reason.
 - Default to the versioned public artifact projection; require explicit opt-in
@@ -174,8 +177,9 @@ Deliverables:
 
 Acceptance gate: semantically identical runs produce no material diff,
 malformed artifacts identify the failing line, and the versioned public
-artifact projection is the default. This work has not started and remains gated
-on merge-ready Week 2 validation.
+artifact projection is the default. Inspection implements the input validation
+and projection requirements, including validation of unselected records before
+output. The material-diff acceptance gate remains pending.
 
 ### Weeks 4–5: Add Inbound Observations
 

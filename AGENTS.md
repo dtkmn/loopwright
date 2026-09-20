@@ -3,12 +3,11 @@
 ## Project Overview
 
 This repository is Loopwright, a flight recorder for inspecting and hardening
-AI loops: context selection, retrieval, answer
-drafting, mechanical checks, verifier decisions, retries, refusals, evals, and
-future inspect/diff. Deterministic re-execution is not implemented. The current
-built-in evidence providers are Smart Evidence
-routing, DuckDuckGo web snippets, optional uploaded-file context, thread memory,
-and direct model knowledge.
+AI loops: context selection, retrieval, answer drafting, mechanical checks,
+verifier decisions, retries, refusals, evals, offline artifact inspection, and
+future semantic diff. Deterministic re-execution is not implemented. The current
+built-in evidence providers are Smart Evidence routing, DuckDuckGo web snippets,
+optional uploaded-file context, thread memory, and direct model knowledge.
 
 Primary runtime files:
 
@@ -62,6 +61,9 @@ Primary runtime files:
   data over the network.
 - `src/loop_export.py`: local JSONL-to-adapter export CLI for OpenAI trace and
   LangGraph manifest artifacts.
+- `src/loop_replay.py`: offline raw-session JSONL inspector with readable and
+  JSON output. It reuses the strict export loader and shared public projection;
+  semantic diff and model re-execution are not implemented.
 - `src/app.py`: FastAPI backend, static frontend serving, upload/query routes,
   and user-facing status messages.
 - `src/thread_store.py`: local SQLite thread metadata, message, durable
@@ -192,7 +194,7 @@ Primary runtime files:
   retry/refusal state, and final answer.
 - Completed query loop reports must be retained in bounded in-memory
   `LoopSession` state keyed by `session_id`. Local session JSONL export writes
-  raw loop reports for developer diagnostics and future inspect/diff input; it
+  raw loop reports for developer diagnostics, inspection, and future diff input; it
   is not a replay or re-execution engine. Public UI traces must use the public
   artifact projection.
 - Web/API threads must pass an explicit validated `session_id` into
@@ -224,6 +226,10 @@ Primary runtime files:
 - `src.loop_export` must default to the public artifact projection. Raw export
   is a local diagnostics path and must require an explicit `--raw` flag. Treat
   every exported artifact as potentially sensitive.
+- `src.loop_replay inspect` must remain offline and dependency-free, validate
+  the entire raw JSONL input before output, retain physical source line numbers,
+  and render only the public projection by default. Raw diagnostics require
+  `--raw`; recorded verification must not be presented as independent proof.
 - `pyproject.toml` and `uv.lock` are the dependency contract for local development,
   CI, and Docker. Use `uv sync --locked` for installation and `uv run --locked`
   for project commands. Do not restore requirements exports or pip installation
@@ -289,6 +295,7 @@ For Python behavior changes:
 - `uv run --locked pytest tests/test_openai_trace_adapter.py -q`
 - `uv run --locked pytest tests/test_langgraph_manifest_adapter.py -q`
 - `uv run --locked pytest tests/test_loop_export.py -q`
+- `uv run --locked pytest tests/test_loop_replay.py -q`
 - `uv lock --check`
 - `uv run --locked python -m py_compile src/__init__.py src/app.py src/thread_store.py src/web_contract.py src/env_file.py src/ai_loop_engine.py src/ai_loop_runtime.py src/context_providers.py src/retrieval.py src/retrieval_types.py src/answer_loop.py src/document_config.py src/document_text.py src/document_ingestion.py src/runtime_config.py src/model_adapters.py src/web_search.py src/DocumentQA.py src/native_runtime.py src/golden_eval.py src/loop_engine.py src/public_projection.py src/loop_eval.py src/loop_export.py src/ollama_model_eval.py src/adapters/__init__.py src/adapters/base.py src/adapters/redaction.py src/adapters/openai_trace.py src/adapters/langgraph_manifest.py tests/conftest.py tests/test_app.py tests/test_env_file.py tests/test_document_qa.py tests/test_native_runtime.py tests/test_golden_document_eval.py tests/test_loop_engine.py tests/test_loop_eval.py tests/test_loop_export.py tests/test_ollama_model_eval.py tests/test_openai_trace_adapter.py tests/test_langgraph_manifest_adapter.py tests/test_packaging_metadata.py tests/test_thread_store.py`
 - `uv pip check`
