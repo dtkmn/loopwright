@@ -275,7 +275,8 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
   in-memory `LoopSession` objects keyed by `session_id` for local artifact export
   during the running process.
 - **Session artifacts:** local JSONL export writes one raw `LoopReport` per line,
-  readable offline with `src.loop_replay inspect`; semantic diff remains planned
+  readable offline with `src.loop_replay inspect` and comparable with
+  `src.loop_replay diff`
 - **Public trace surface:** the FastAPI/static web app shows a readable Loop
   Timeline, compact loop summary, and the versioned
   `loop-public-report/v1` artifact. One allowlist-only projector is used by the
@@ -522,8 +523,58 @@ records require `--raw`, and missing provenance remains unknown. Raw text mode a
 includes each complete diagnostic report.
 
 Inspection reports what was recorded; it does not independently verify the answer
-or establish verifier independence. Semantic `diff` and deterministic model
-re-execution remain unimplemented.
+or establish verifier independence. Deterministic model re-execution remains
+unimplemented.
+
+### Compare Two Recorded Runs
+
+Compare single-run artifacts, or select an exact JSONL line on each side when
+either file contains multiple runs:
+
+```bash
+uv run --locked python -m src.loop_replay diff before.jsonl after.jsonl
+
+uv run --locked python -m src.loop_replay diff before.jsonl after.jsonl \
+  --before-report-index 2 --after-report-index 4 --format json
+```
+
+You choose the pair. Matching run IDs or questions are not used to infer that
+the runs performed the same task. Both complete artifacts are validated before
+any output, including unselected records. Errors identify the side, path, and
+physical line; comparison returns exit code 0 even when differences exist, and
+invalid input returns 2. Use `--before-session-id` or `--after-session-id` if
+reports on that side omit a session identity.
+
+The comparison shows changes in recorded outcomes, terminal reasons, completion
+state, context provider, public memory counts/status, policy flags, model and
+verifier provenance, evidence identity/citation mapping/locators, ordered steps,
+retry counts, error/review presence, and permitted final answers. Evidence order
+is normalized by citation number; final answer text is compared exactly. Steps
+align by phase and retry count while
+preserving recorded order; additions and removals remain visible. This alignment
+does not establish causal identity between steps.
+
+Generated run/session/step IDs and absolute timestamps remain source provenance;
+they do not create material differences. Run and matched-step durations appear
+separately as timing changes. Unknown and redacted values stay explicitly
+unavailable. “No observed material changes” means no changes in comparable
+recorded fields, not full equivalence or proof of correctness.
+
+`--format json` emits `loop-diff/v1` with source descriptors, an outcome summary,
+`material_changes`, `timing_changes`, `unavailable_fields`, and explicit comparison
+limits. Public projection is the default. Configuration comparison covers typed
+policy and model fields only; prompts, recipes, arbitrary configuration metadata,
+step summaries, verifier reasons, raw errors, and causal metadata references are
+outside the comparison scope.
+
+`--raw` compares the same operational fields without public suppression; JSON
+output additionally includes both full raw reports for manual diagnosis. It is
+not validated for public serving and can expose otherwise suppressed content.
+Raw memory metadata is not compared. Empty raw evidence references and unspecified
+terminal reasons remain unavailable, so historical v1 omissions are not presented
+as known absence. Private metadata changes remain visible in the attached raw
+reports but are not classified as material changes. Use `inspect --raw` to read
+the full raw report in text form.
 
 ### Optional Live Ollama Model Eval
 

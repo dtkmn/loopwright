@@ -443,8 +443,11 @@ def test_inspect_help_describes_limits_and_explicit_raw(capsys):
     assert "not independent proof" in output
 
 
-def test_diff_is_not_advertised_as_an_available_command(capsys):
+def test_diff_help_describes_explicit_pairing_and_no_execution(capsys):
     with pytest.raises(SystemExit) as exc:
-        main(["diff", "before.jsonl", "after.jsonl"])
-    assert exc.value.code == 2
-    assert "invalid choice" in capsys.readouterr().err
+        main(["diff", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--before-report-index" in help_text
+    assert "--after-report-index" in help_text
+    assert "task equivalence is not inferred" in help_text

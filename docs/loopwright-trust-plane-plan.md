@@ -23,15 +23,16 @@ versioned public run records, and local raw JSONL export. Evidence-backed routes
 retrieve, draft, mechanically check, verify, and may retry or refuse. Direct
 routes draft without retrieved evidence and finish `not_verified`. A single
 allowlist-only `loop-public-report/v1` projector supplies web responses,
-durable history, adapters, the export CLI, and offline session inspection.
+durable history, adapters, the export CLI, and offline inspection/comparison.
 `src.loop_replay inspect` reads raw session JSONL into readable summaries or
-versioned JSON, using the public projection by default. It also exports OpenAI
+versioned JSON, using the public projection by default. `src.loop_replay diff`
+compares two selected recorded runs, separating material and timing changes.
+The product also exports OpenAI
 trace-shaped JSON and LangGraph manifest JSON; those export modules do not
 import or execute the target framework runtimes.
 
 It does not yet provide:
 
-- semantic `diff` commands for session artifacts;
 - deterministic re-execution replay;
 - inbound Codex or Claude trace normalization;
 - Microsoft workflow-event export;
@@ -50,10 +51,12 @@ constructed completed reports may retain an `unspecified` terminal reason.
 The public boundary is now `loop-public-report/v1`: a versioned allowlist rather
 than a raw-report copy with selective redaction. Hostile tests cover terminal
 contradictions, identity mismatch, legacy re-projection, and malformed-record
-quarantine. That baseline passed full validation and was merged. The inspection
-portion of Week 3 is now implemented locally: public summaries, explicit raw
-diagnostics, JSON output, run selection, and exact input-line errors. Semantic
-diff remains pending; external trace ingestion remains behind the Week 3 gate.
+quarantine. That baseline and the Week 3 inspection portion passed full validation
+and were merged. Semantic comparison is now implemented locally, with explicit
+run pairing, normalized operational fields, separate timing changes, and visible
+unavailable provenance. This does not satisfy the operator usability proof:
+recorded comparison demonstrations and unfamiliar-user feedback remain pending.
+External trace ingestion is still a separate, unimplemented milestone.
 
 ## Success Metric
 
@@ -80,7 +83,7 @@ Deliverables:
 - Use **Loop Recipes**, not “skills”; recipes do not grant tools, scheduling, or
   autonomous action.
 - Describe JSONL as a local session or diagnostic artifact with offline
-  inspection. Keep semantic diff and re-execution explicitly planned.
+  inspection and comparison. Keep re-execution explicitly planned.
 - Keep Microsoft workflow-event export explicitly planned.
 - Say that evidence makes unsupported behavior harder—but not impossible—to
   fake.
@@ -168,18 +171,29 @@ Deliverables:
 
 - Implemented: `src.loop_replay inspect <session.jsonl>` for readable run
   summaries, `--format json`, and `--report-index` selection.
-- Pending: `src.loop_replay diff <before.jsonl> <after.jsonl>` for semantic changes.
-- Compare phases, decisions, evidence identity, retry behavior, verification,
-  model and configuration metadata, timing, and terminal reason.
+- Implemented: `src.loop_replay diff <before.jsonl> <after.jsonl>`, with explicit
+  per-side line selectors when an artifact contains multiple runs.
+- Compare phases, decisions, evidence identity/citation mapping, retry behavior,
+  verification, model fields, typed policy, public memory provenance, completion
+  state, error/review presence, terminal reason, and permitted final answers.
+  Arbitrary configuration/recipe metadata and causal metadata references are
+  outside the operational comparison contract; raw JSON can include complete
+  source reports for manual diagnosis.
+- Ignore generated identities and absolute timestamps as material differences;
+  report run and matched-step durations separately. Align steps by phase and
+  retry count in recorded order without claiming causal identity.
 - Default to the versioned public artifact projection; require explicit opt-in
   for raw local diagnostics.
 - Fail closed on malformed input and report exact JSONL line provenance.
 
 Acceptance gate: semantically identical runs produce no material diff,
 malformed artifacts identify the failing line, and the versioned public
-artifact projection is the default. Inspection implements the input validation
-and projection requirements, including validation of unselected records before
-output. The material-diff acceptance gate remains pending.
+artifact projection is the default. Inspection and comparison implement these
+requirements, including validation of unselected records before output. Missing
+or redacted fields remain unavailable, so no observed material changes cannot
+establish full equivalence, shared task identity, or correctness. Provider-free
+regression fixtures cover these boundaries; the operator usability proof remains
+pending.
 
 ### Weeks 4–5: Add Inbound Observations
 

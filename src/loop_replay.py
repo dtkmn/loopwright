@@ -1,4 +1,4 @@
-"""Read-only inspection of recorded loops; no replay or model execution."""
+"""Read-only inspection and comparison of recorded loops; no model execution."""
 
 import argparse
 import json
@@ -6,6 +6,7 @@ import sys
 import unicodedata
 from typing import Optional, Sequence
 
+from src.loop_diff import compare_reports
 from src.loop_export import load_session
 
 
@@ -14,8 +15,8 @@ INSPECTION_SCHEMA_VERSION = "loop-inspection/v1"
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect recorded Loopwright runs offline. No model execution.",
-        epilog="Semantic diff and deterministic re-execution are not implemented.",
+        description="Inspect and compare recorded Loopwright runs offline. No model execution.",
+        epilog="Deterministic model re-execution is not implemented.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser(
@@ -31,10 +32,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     inspect.add_argument("input", help="Path to raw loop-report/v1 JSONL records.")
-    inspect.add_argument(
-        "--format", choices=("text", "json"), default="text",
-        help="Readable summary (default) or a versioned JSON inspection envelope.",
-    )
+    _add_output_options(inspect)
     inspect.add_argument(
         "--report-index", type=int,
         help="Show one run by 1-based JSONL line; the entire input is still validated.",
@@ -42,7 +40,35 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     inspect.add_argument(
         "--session-id", help="Required if any input report omits its session id.",
     )
-    visibility = inspect.add_mutually_exclusive_group()
+    diff = commands.add_parser(
+        "diff",
+        help="Compare two selected runs from local raw JSONL artifacts.",
+        description=(
+            "Compare recorded operational fields; task equivalence is not inferred. "
+            "Generated IDs and absolute timestamps do not count as material changes."
+        ),
+    )
+    diff.add_argument("before", help="Raw session JSONL containing the before run.")
+    diff.add_argument("after", help="Raw session JSONL containing the after run.")
+    for side in ("before", "after"):
+        diff.add_argument(
+            f"--{side}-report-index", type=int,
+            help=f"1-based {side} JSONL line; required if that file contains multiple runs.",
+        )
+        diff.add_argument(
+            f"--{side}-session-id",
+            help=f"Explicit session id if {side} reports omit one.",
+        )
+    _add_output_options(diff)
+    return parser.parse_args(argv)
+
+
+def _add_output_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--format", choices=("text", "json"), default="text",
+        help="Readable summary (default) or a versioned JSON envelope.",
+    )
+    visibility = parser.add_mutually_exclusive_group()
     visibility.add_argument(
         "--public", dest="public", action="store_true", default=True,
         help="Use the shared versioned public projection (default).",
@@ -50,11 +76,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     visibility.add_argument(
         "--raw", dest="public", action="store_false",
         help=(
-            "Include full local diagnostics, including suppressed content. Also accepts "
+            "Use unprojected local diagnostics, including suppressed content. Also accepts "
             "historical v1 records; absent provenance stays unknown."
         ),
     )
-    return parser.parse_args(argv)
 
 
 def inspect_artifact(
@@ -95,6 +120,66 @@ def inspect_artifact(
     }
 
 
+def _select_diff_report(inspection: dict, index: Optional[int], side: str) -> dict:
+    count = inspection["input_report_count"]
+    if index is None:
+        if count != 1:
+            raise ValueError(
+                f"{side} artifact {inspection['source_path']} contains {count} runs; "
+                f"select one with --{side}-report-index."
+            )
+        index = 1
+    if type(index) is not int or not 1 <= index <= count:
+        raise ValueError(f"--{side}-report-index must be between 1 and {count}.")
+    return inspection["reports"][index - 1]
+
+
+def _diff_source(inspection: dict, entry: dict) -> dict:
+    report = entry["report"]
+    source = {
+        "source_path": inspection["source_path"],
+        "source_jsonl_line": entry["source_jsonl_line"],
+        "run_id": report["run"]["run_id"],
+        "session_id": inspection["session_id"],
+        "projection_schema_version": report.get("projection_schema_version"),
+    }
+    if not inspection["public"]:
+        source["raw_report"] = report
+    return source
+
+
+def diff_artifacts(
+    before_path: str,
+    after_path: str,
+    *,
+    public: bool = True,
+    before_report_index: Optional[int] = None,
+    after_report_index: Optional[int] = None,
+    before_session_id: Optional[str] = None,
+    after_session_id: Optional[str] = None,
+) -> dict:
+    """Validate both complete artifacts, then compare one selected run per side."""
+
+    inspections = []
+    for side, path, session_id in (
+        ("before", before_path, before_session_id),
+        ("after", after_path, after_session_id),
+    ):
+        try:
+            inspections.append(inspect_artifact(path, public=public, session_id=session_id))
+        except (OSError, ValueError) as exc:
+            detail = str(exc).replace("--session-id", f"--{side}-session-id")
+            raise ValueError(f"{side} artifact {path}: {detail}") from exc
+    before_inspection, after_inspection = inspections
+    before = _select_diff_report(before_inspection, before_report_index, "before")
+    after = _select_diff_report(after_inspection, after_report_index, "after")
+    return {
+        **compare_reports(before["report"], after["report"], public=public),
+        "before": _diff_source(before_inspection, before),
+        "after": _diff_source(after_inspection, after),
+    }
+
+
 def _display(value) -> str:
     """Keep artifact text from injecting terminal controls or extra output lines."""
 
@@ -103,11 +188,15 @@ def _display(value) -> str:
     if type(value) is bool:
         return "yes" if value else "no"
     escaped = json.dumps(str(value), ensure_ascii=False)[1:-1]
+    return _escape_controls(escaped)
+
+
+def _escape_controls(value: str) -> str:
     return "".join(
         json.dumps(character, ensure_ascii=True)[1:-1]
         if unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
         else character
-        for character in escaped
+        for character in value
     )
 
 
@@ -210,6 +299,91 @@ def render_text(inspection: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _diff_value(value) -> str:
+    if isinstance(value, dict) and set(value) == {"availability"}:
+        return f"<{value['availability']}>"
+    # JSON retains types and distinguishes literal strings from availability labels.
+    return _escape_controls(json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False))
+
+
+def _step_summary(step: dict) -> str:
+    summary = (
+        f"{_display(step['phase'])} -> {_display(step['decision'])} "
+        f"(retry {step['retry_count']}, completed: {_display(step['completed'])})"
+    )
+    verification = step["verification"]
+    if verification is not None and "outcome" in verification:
+        summary += f"; verification recorded: {_display(verification['outcome'])}"
+        summary += f"; verifier: {_diff_value(verification['model'])}"
+    if step["human_review_required"]:
+        summary += "; human review requested"
+    if step["error_present"]:
+        summary += "; error recorded"
+    return summary
+
+
+def _render_changes(changes: list[dict]) -> list[str]:
+    lines = []
+    for change in changes:
+        if change["kind"] in {"added", "removed"}:
+            side = "after" if change["kind"] == "added" else "before"
+            index = change[f"{side}_step"]["index"]
+            lines.append(
+                f"  {change['kind'].capitalize()} {side} step {index}: "
+                f"{_step_summary(change[side])}"
+            )
+            continue
+        location = change["field"]
+        if "before_step" in change:
+            before_index = (change["before_step"] or {}).get("index", "absent")
+            after_index = (change["after_step"] or {}).get("index", "absent")
+            location += f" [before step {before_index}, after step {after_index}]"
+        lines.append(f"  {_display(location)} ({change['kind']}):")
+        lines.append(f"    before: {_diff_value(change['before'])}")
+        lines.append(f"    after:  {_diff_value(change['after'])}")
+    return lines
+
+
+def render_diff_text(comparison: dict) -> str:
+    visibility = "public projection" if comparison["public"] else "RAW local diagnostics"
+    lines = [f"Loopwright run comparison ({visibility})"]
+    for side in ("before", "after"):
+        source = comparison[side]
+        lines.append(
+            f"{side.capitalize()}: {_display(source['source_path'])} "
+            f"[JSONL line {source['source_jsonl_line']}; run {_display(source['run_id'])}; "
+            f"session {_display(source['session_id'])}]"
+        )
+    lines.extend([
+        "Selected runs only; same task not established. No model execution or independent verification.",
+        "Outcome: " + " -> ".join(
+            _diff_value(comparison["summary"][side]["decision"]) for side in ("before", "after")
+        ),
+        "Terminal reason: " + " -> ".join(
+            _diff_value(comparison["summary"][side]["terminal_reason"]) for side in ("before", "after")
+        ),
+        "Highest recorded retry count: " + " -> ".join(
+            str(comparison["summary"][side]["retry_count"]) for side in ("before", "after")
+        ),
+        "",
+        (
+            f"Material changes in recorded fields: {len(comparison['material_changes'])}"
+            if comparison["has_material_changes"]
+            else "No observed material changes in comparable recorded fields."
+        ),
+    ])
+    lines.extend(_render_changes(comparison["material_changes"]))
+    lines.append(f"Timing changes (separate from material changes): {len(comparison['timing_changes'])}")
+    lines.extend(_render_changes(comparison["timing_changes"]))
+    if comparison["unavailable_fields"]:
+        lines.append("Unavailable fields (cannot establish equality):")
+        for field in comparison["unavailable_fields"]:
+            lines.append(f"  {field['side']}.{field['field']}: {field['availability']}")
+    lines.append("Comparison limits:")
+    lines.extend(f"  {note}" for note in comparison["limitations"])
+    return "\n".join(lines) + "\n"
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     *,
@@ -220,17 +394,26 @@ def main(
     error_stream = error_stream or sys.stderr
     args = parse_args(argv)
     try:
-        inspection = inspect_artifact(
-            args.input, public=args.public, report_index=args.report_index,
-            session_id=args.session_id,
-        )
-        output = (
-            _json(inspection) + "\n"
-            if args.format == "json" else render_text(inspection)
-        )
+        if args.command == "inspect":
+            payload = inspect_artifact(
+                args.input, public=args.public, report_index=args.report_index,
+                session_id=args.session_id,
+            )
+            renderer = render_text
+        else:
+            payload = diff_artifacts(
+                args.before, args.after, public=args.public,
+                before_report_index=args.before_report_index,
+                after_report_index=args.after_report_index,
+                before_session_id=args.before_session_id,
+                after_session_id=args.after_session_id,
+            )
+            renderer = render_diff_text
+        output = _json(payload) + "\n" if args.format == "json" else renderer(payload)
         print(output, end="", file=output_stream)
     except (OSError, ValueError) as exc:
-        print(f"Cannot inspect {_display(args.input)}: {_display(str(exc))}", file=error_stream)
+        action = f"inspect {_display(args.input)}" if args.command == "inspect" else "compare runs"
+        print(f"Cannot {action}: {_display(str(exc))}", file=error_stream)
         return 2
     return 0
 
