@@ -9,8 +9,8 @@ Research baseline: 2026-06-24. Last reviewed: 2026-07-17.
 Loopwright should interoperate with current agent frameworks without letting
 any framework become the core product architecture. The internal contract remains
 `LoopReport`, `LoopSession`, provider-neutral phases, explicit verifier
-decisions, guardrail decisions, and local diagnostic artifacts that may become
-future inspect/diff input.
+decisions, guardrail decisions, and local diagnostic artifacts for offline
+inspection and future semantic-diff input.
 
 This note covers optional adapter directions for:
 
@@ -42,7 +42,8 @@ The useful internal adapter boundary is already mostly present:
   format checks, mechanical checks, verifier decisions, retries, refusals, final answers, and
   errors.
 - `LoopSession`: bounded in-memory run history keyed by `session_id`, with raw
-  JSONL export for local diagnostics and future inspect/diff input. Loopwright
+  JSONL export for local diagnostics, offline inspection, and future diff input.
+  Loopwright
   does not currently replay or re-execute those records.
 - `LoopPolicy`: explicit guardrail policy, including no autonomous tools by
   default.
@@ -127,7 +128,7 @@ data across threads.
 | `LoopStep.phase` | node name or superstep label | Start as labels, not executable nodes. |
 | `LoopStep.metadata` | checkpoint metadata | Must stay JSON-safe. |
 | `LoopReport.final_decision` | terminal graph state | Preserve supported/not_verified/refuse/block/error. |
-| `LoopSession` JSONL | diagnostic/future inspect-diff source | Not a replay engine or LangGraph checkpointer. |
+| `LoopSession` JSONL | diagnostic/inspection source; future diff input | Not a replay engine or LangGraph checkpointer. |
 
 ### Recommended Adapter
 

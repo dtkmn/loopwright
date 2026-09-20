@@ -118,7 +118,14 @@ def load_session(
     allow_legacy_raw: bool = False,
 ) -> LoopSession:
     path = Path(input_path)
-    content = path.read_text(encoding="utf-8")
+    encoded_content = path.read_bytes()
+    try:
+        content = encoded_content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        line_number = encoded_content.count(b"\n", 0, exc.start) + 1
+        raise ValueError(
+            f"Invalid loop report JSONL at line {line_number}: invalid UTF-8"
+        ) from exc
     reports = _read_reports_jsonl(content, allow_legacy_raw=allow_legacy_raw)
     if not reports:
         raise ValueError("No loop reports found in input JSONL.")
@@ -126,14 +133,33 @@ def load_session(
         session_id,
         field_name="--session-id",
     )
-    if session_id is None:
-        if any(report.run.session_id is None for report in reports):
+    inferred_session_id = (
+        reports[0].run.session_id if session_id is None else session_id
+    )
+    seen_run_ids = {}
+    for line_number, report in enumerate(reports, start=1):
+        if session_id is None and report.run.session_id is None:
             raise ValueError(
+                f"Invalid loop session JSONL at line {line_number}: "
                 "Input reports omit session_id; supply --session-id explicitly."
             )
-        inferred_session_id = reports[0].run.session_id
-    else:
-        inferred_session_id = session_id
+        if (
+            report.run.session_id is not None
+            and report.run.session_id != inferred_session_id
+        ):
+            raise ValueError(
+                f"Invalid loop session JSONL at line {line_number}: "
+                "LoopSession cannot contain reports from another session: "
+                f"{report.run.session_id!r}"
+            )
+        if report.run.run_id in seen_run_ids:
+            first_line = seen_run_ids[report.run.run_id]
+            raise ValueError(
+                f"Invalid loop session JSONL at line {line_number}: "
+                "LoopSession cannot contain duplicate run ids "
+                f"(first seen at line {first_line})."
+            )
+        seen_run_ids[report.run.run_id] = line_number
     try:
         return LoopSession(
             session_id=inferred_session_id,
@@ -147,7 +173,12 @@ def _read_reports_jsonl(
     content: str, *, allow_legacy_raw: bool = False
 ) -> list[LoopReport]:
     reports = []
-    for line_number, line in enumerate(content.splitlines(), start=1):
+    # JSONL records are framed by LF, with CRLF accepted as JSON whitespace.
+    # Unicode line separators inside JSON strings are data, not record breaks.
+    lines = content.split("\n") if content else []
+    if lines and lines[-1] == "":
+        lines.pop()
+    for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             raise ValueError(
                 f"Invalid loop report JSONL at line {line_number}: blank line"
@@ -183,6 +214,11 @@ def _read_reports_jsonl(
         except json.JSONDecodeError as exc:
             raise ValueError(
                 f"Invalid loop report JSONL at line {line_number}: {exc.msg}"
+            ) from exc
+        except RecursionError as exc:
+            raise ValueError(
+                f"Invalid loop report JSONL at line {line_number}: "
+                "JSON nesting exceeds the supported depth"
             ) from exc
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(

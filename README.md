@@ -275,12 +275,12 @@ Ollama and fails closed if Ollama is not reachable. Use explicit
   in-memory `LoopSession` objects keyed by `session_id` for local artifact export
   during the running process.
 - **Session artifacts:** local JSONL export writes one raw `LoopReport` per line,
-  suitable as future inspect/diff input
+  readable offline with `src.loop_replay inspect`; semantic diff remains planned
 - **Public trace surface:** the FastAPI/static web app shows a readable Loop
   Timeline, compact loop summary, and the versioned
   `loop-public-report/v1` artifact. One allowlist-only projector is used by the
-  runtime report API, durable history, adapters, and export CLI. It keeps typed
-  operational provenance but omits prompts, arbitrary step names and
+  runtime report API, durable history, adapters, export CLI, and inspector. It
+  keeps typed operational provenance but omits prompts, arbitrary step names and
   summaries, raw errors and metadata, verifier reasons and raw payloads, recipe
   text, and human-review bodies. A valid non-guardrail completion may expose its
   final answer. Refuse, block, review, or another guardrail-like terminal signal
@@ -476,25 +476,54 @@ invent evidence bindings or make legacy records eligible for public export.
 ### Local Session Artifacts
 
 `AILoopEngine` keeps recent loop reports in memory per `session_id`. Export a
-session locally when you need a raw diagnostic artifact or future inspect/diff
-input:
+session locally when you need a diagnostic artifact for offline inspection:
 
 ```python
 qa_system.export_loop_session_jsonl("artifacts/loop-session-default.jsonl")
 ```
 
-Each JSONL line is a raw `loop-report/v1` object. Treat these files as local
-developer diagnostics because they may include prompts, retrieved excerpts,
-draft outputs, and final answers. Planned inspect/diff commands should look like:
+Each JSONL line is a raw `loop-report/v1` object. These files may include prompts,
+retrieved excerpts, draft outputs, and final answers. Inspect a saved file without
+the app database or a running model:
 
 ```bash
 uv run --locked python -m src.loop_replay inspect artifacts/loop-session-default.jsonl
-uv run --locked python -m src.loop_replay diff before.jsonl after.jsonl
+
+# Select one run by its 1-based JSONL line and produce structured output.
+uv run --locked python -m src.loop_replay inspect artifacts/loop-session-default.jsonl \
+  --report-index 2 --format json
+
+# Explicitly include full raw diagnostics, including otherwise suppressed content.
+uv run --locked python -m src.loop_replay inspect artifacts/loop-session-default.jsonl \
+  --raw --format json
 ```
 
-Those commands are intentionally not implemented yet. The report and public
-projection shapes need to stay stable before inspect/diff becomes a real
-product surface. Deterministic model re-execution is not implemented.
+The default text summary shows recorded phases and decisions, evidence identities
+and locators, mechanical checks, verifier outcomes and same-model status, retries,
+terminal reason, and the permitted final answer. It uses the shared
+`loop-public-report/v1` projection: terminal guardrail-like outcomes suppress the
+answer, model identity, and evidence. It never substitutes raw fields for withheld
+values. This is data minimization, not access control or a general secret/PII scrub;
+even public output can contain sensitive answers and typed provenance.
+
+`--format json` emits a `loop-inspection/v1` envelope with source path, session id,
+input/selected report counts, and the source JSONL line plus report for each run.
+The entire file is validated before any output, even when selecting one run.
+Malformed records fail with a source line and exit code 2. Output goes to stdout;
+the inspector does not modify artifacts, read the app database, contact providers,
+or load native/model dependencies. It can also run with a supported Python directly
+from the checkout (`python -m src.loop_replay inspect ...`), without installing
+the app dependencies.
+
+Input must be raw session JSONL, not a public projection, adapter export, or eval
+result envelope. If reports omit a session id, supply `--session-id` explicitly;
+this labels the inspection without rewriting the original reports. Historical v1
+records require `--raw`, and missing provenance remains unknown. Raw text mode also
+includes each complete diagnostic report.
+
+Inspection reports what was recorded; it does not independently verify the answer
+or establish verifier independence. Semantic `diff` and deterministic model
+re-execution remain unimplemented.
 
 ### Optional Live Ollama Model Eval
 

@@ -298,6 +298,7 @@ def test_loop_export_requires_session_id_for_sessionless_jsonl(tmp_path):
     )
 
     assert exit_code == 2
+    assert "Invalid loop session JSONL at line 1" in errors.getvalue()
     assert "supply --session-id explicitly" in errors.getvalue()
 
 
@@ -320,6 +321,7 @@ def test_loop_export_does_not_infer_missing_later_report_session(tmp_path):
     )
 
     assert exit_code == 2
+    assert "Invalid loop session JSONL at line 2" in errors.getvalue()
     assert "supply --session-id explicitly" in errors.getvalue()
 
 
@@ -604,6 +606,8 @@ def test_loop_export_rejects_duplicate_run_identity(tmp_path):
     )
 
     assert exit_code == 2
+    assert "Invalid loop session JSONL at line 2" in errors.getvalue()
+    assert "first seen at line 1" in errors.getvalue()
     assert "duplicate run ids" in errors.getvalue()
 
 
@@ -938,3 +942,122 @@ def test_loop_export_rejects_out_of_range_report_index(tmp_path):
 
     assert exit_code == 2
     assert "--report-index must be between 1 and 1" in errors.getvalue()
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("trailing_newline", [False, True])
+def test_load_session_preserves_unicode_separators_inside_json_strings(
+    tmp_path, newline, trailing_newline
+):
+    first = sample_report("run_one").to_dict()
+    first["run"]["user_input"] = "first\u0085second\u2028third\u2029fourth"
+    second = sample_report("run_two").to_dict()
+    content = newline.join(
+        json.dumps(payload, ensure_ascii=False) for payload in (first, second)
+    )
+    if trailing_newline:
+        content += newline
+    input_path = tmp_path / "unicode-separators.jsonl"
+    input_path.write_bytes(content.encode("utf-8"))
+
+    session = loop_export_module.load_session(str(input_path))
+
+    assert session.report_count == 2
+    assert session.reports[0].run.user_input == first["run"]["user_input"]
+    assert session.reports[1].run.run_id == "run_two"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_load_session_rejects_trailing_blank_record_with_physical_line(
+    tmp_path, newline
+):
+    input_path = tmp_path / "trailing-blank.jsonl"
+    serialized = json.dumps(sample_report("run_one").to_dict())
+    input_path.write_bytes((serialized + newline + newline).encode("utf-8"))
+
+    with pytest.raises(ValueError, match="JSONL at line 2: blank line"):
+        loop_export_module.load_session(str(input_path))
+
+
+@pytest.mark.parametrize("raw_args", [[], ["--raw"]])
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_loop_export_reports_invalid_utf8_at_physical_line(
+    tmp_path, raw_args, newline
+):
+    first = sample_report("run_one").to_dict()
+    first["run"]["user_input"] = "unicode\u0085separators\u2028remain\u2029data"
+    input_path = tmp_path / "invalid-utf8.jsonl"
+    input_path.write_bytes(
+        json.dumps(first, ensure_ascii=False).encode("utf-8")
+        + newline
+        + b"\xff"
+        + newline
+    )
+    output = io.StringIO()
+    errors = io.StringIO()
+
+    exit_code = main(
+        ["--adapter", "openai-trace", "--input", str(input_path), *raw_args],
+        output_stream=output,
+        error_stream=errors,
+    )
+
+    assert exit_code == 2
+    assert output.getvalue() == ""
+    assert errors.getvalue() == (
+        "Invalid loop report JSONL at line 2: invalid UTF-8\n"
+    )
+
+
+@pytest.mark.parametrize("raw_args", [[], ["--raw"]])
+def test_loop_export_rejects_excessive_json_nesting_with_line(
+    tmp_path, raw_args
+):
+    input_path = tmp_path / "deeply-nested.jsonl"
+    serialized = json.dumps(sample_report("run_one").to_dict())
+    input_path.write_text(
+        serialized + "\n" + "[" * 10000 + "0" + "]" * 10000 + "\n",
+        encoding="utf-8",
+    )
+    output = io.StringIO()
+    errors = io.StringIO()
+
+    exit_code = main(
+        ["--adapter", "langgraph-manifest", "--input", str(input_path), *raw_args],
+        output_stream=output,
+        error_stream=errors,
+    )
+
+    assert exit_code == 2
+    assert output.getvalue() == ""
+    assert errors.getvalue() == (
+        "Invalid loop report JSONL at line 2: "
+        "JSON nesting exceeds the supported depth\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("supplied_session_id", "expected_line"),
+    [(None, 2), ("session_cli", 2), ("session_other", 1)],
+)
+def test_load_session_reports_conflicting_session_at_source_line(
+    tmp_path, supplied_session_id, expected_line
+):
+    first = sample_report("run_one").to_dict()
+    second = sample_report("run_two").to_dict()
+    second["run"]["session_id"] = "session_other"
+    input_path = tmp_path / "conflicting-session.jsonl"
+    input_path.write_text(
+        json.dumps(first) + "\n" + json.dumps(second) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"Invalid loop session JSONL at line {expected_line}: "
+            "LoopSession cannot contain reports from another session"
+        ),
+    ):
+        loop_export_module.load_session(
+            str(input_path), session_id=supplied_session_id
+        )
